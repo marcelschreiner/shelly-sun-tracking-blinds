@@ -12,7 +12,7 @@ Tested on Shelly Gen2 and newer in the Cover profile.
 - Slat angle from slat width, slat distance and window orientation
 - Tracking in a configurable angular step, with a minimum pause between movements
 - Day and night positions, triggered either by sunrise or by an external wake call
-- Manual operation pauses the automation until the evening
+- Manual operation pauses the automation for the rest of the local day
 - Heat demand supplied from outside as a plain yes/no over HTTP
 - Layered fallbacks for network, hub or time server failures
 
@@ -105,11 +105,19 @@ stateDiagram-v2
     Manual --> Night: sunset
     Day_open --> Night: sunset
     Shading --> Night: sunset
+    Night --> Night: local midnight<br/>clears both flags
 ```
 
 `Day_locked` exists only with `dayTrigger: "cmd"`. In that state the blind stays down
 and shading does not engage either, so the morning sun cannot wake anyone. With
-`dayTrigger: "sun"` the state is skipped immediately.
+`dayTrigger: "sun"` the state is skipped immediately, including when the script starts
+up in the middle of a day.
+
+Both the manual override and the day release are stored as local day numbers rather
+than as booleans. They therefore expire at local midnight on their own and survive a
+reboot without going stale. A side effect worth knowing: a wake call after sunset is
+ignored, because the day was already released that morning, while a wake call before
+sunrise still works, which is what a winter alarm needs.
 
 If the wake call arrives while shading is already due, the day position is skipped and
 the blind goes straight to the shading position. Otherwise it would travel up and back
@@ -224,13 +232,14 @@ The design goal is that a single device keeps working when everything else fails
 | Heat demand older than `demandMaxAgeH` | Falls back to `fallbackMonths`, the season decides |
 | No wake call arrives | Opens at `dayFallbackHour` at the latest |
 | Power loss | Manual override, heat demand and day release are restored from KVS |
+| Clock synchronises late after boot | The restored heat demand is stamped on the first valid tick, not on restore |
 | No valid clock after boot | Tracking pauses instead of driving to a wrong position |
 
 ## Flash wear
 
 The ESP32 flash tolerates roughly 100,000 write cycles per sector. Only three values are
-persisted, namely the ones that cannot be derived again: manual override, heat demand
-and day release. `saveState()` compares against the last written content and writes only
+persisted, namely the ones that cannot be derived again: manual override day, heat
+demand and day release. `saveState()` compares against the last written content and writes only
 on an actual change. That amounts to a handful of writes per day instead of several
 hundred.
 
@@ -259,6 +268,20 @@ compact one-liners. It looks clumsy, and it is the reason the script runs at all
   firmware and controller, and should be verified on the actual setup.
 - Shelly BLU sensors cannot be added to Apple Home directly. That needs a bridge such
   as Matterbridge or Homebridge.
+
+## Tests
+
+`shading.js` runs unmodified under node against a stub of the Shelly runtime, with a
+virtual clock. The suite covers the solar position against the theoretical solstice
+elevations, the day release, override and wake behaviour, the movement pacing and the
+flash write budget.
+
+```
+node test/run.js
+```
+
+Every case under day release, manual override and wake call corresponds to a bug that
+was found and fixed, so the same mistake cannot come back unnoticed.
 
 ## License
 
