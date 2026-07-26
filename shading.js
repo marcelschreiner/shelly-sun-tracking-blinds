@@ -9,6 +9,10 @@
 //   http://<shelly-ip>/script/1/demand       -> read status only
 //   http://<shelly-ip>/script/1/wake         -> release the day (alarm clock)
 //
+// Manual operation of the cover pauses the automation for the rest of the
+// local day. Both that flag and the day release are stored as day numbers,
+// so they expire at local midnight and survive a reboot without going stale.
+//
 // NOTE on code style: mJS has a very small stack and evaluates
 // expressions recursively. Deeply nested terms and long concatenations
 // overflow it. Everything here is therefore deliberately flat, using
@@ -259,16 +263,19 @@ function angleToSlatPos(ang) {
 // manual override, last heat demand, day release.
 // saveState() writes only on an actual change.
 // ============================================================
+// manualDay and openedDay hold the local day number on which the flag was
+// set. Comparing against today makes both expire at local midnight on their
+// own, and makes them survive a reboot without going stale.
 let ST = {
-  manual: false,       // manually overridden until the next night
+  manualDay: -1,       // day on which manual operation was detected
   active: false,       // tracking is currently running
   lastAng: 999,
   lastMove: 0,
   selfCmd: 0,          // timestamp of our own last movement command
   demand: null,        // true = too warm, false = fine, null = never reported
-  demandTs: 0,
+  demandTs: 0,         // 0 = restored but not yet stamped, see tick()
   phase: null,         // true = day, false = night, null = not yet known
-  opened: false,       // day already released?
+  openedDay: -1,       // day on which the day position was released
   pendingDay: false    // day position still to be driven if no shading
 };
 
@@ -281,7 +288,7 @@ function now() {
 }
 
 function saveState() {
-  let o = { m: ST.manual, d: ST.demand, o: ST.opened };
+  let o = { md: ST.manualDay, d: ST.demand, od: ST.openedDay };
   let s = JSON.stringify(o);
   if (s === saved) return;           // unchanged -> no flash access
   saved = s;
@@ -295,10 +302,12 @@ function loadState() {
     if (!res) return;
     saved = res.value;
     let v = JSON.parse(res.value);
-    ST.manual = v.m;
+    if (v.md !== undefined) ST.manualDay = v.md;
+    if (v.od !== undefined) ST.openedDay = v.od;
     ST.demand = v.d;
-    if (v.o !== undefined) ST.opened = v.o;
-    ST.demandTs = now();             // a restored value counts as fresh again
+    // demandTs stays 0 on purpose. The clock is usually not in sync yet at
+    // this point, so now() would return 0 and the value would immediately
+    // count as expired. tick() stamps it once the clock is valid.
     log("state restored: " + res.value);
   });
 }
@@ -347,22 +356,33 @@ function runEndAction() {
   log("tracking ended, end action " + num(CFG.endAction));
 }
 
-// Local hour from device time (utc_offset also covers daylight saving)
-function localHour(t) {
+// Local time from device time. utc_offset also covers daylight saving.
+// Without it the device falls back to UTC, which shifts dayFallbackHour.
+function localOffset() {
   let s = Shelly.getComponentStatus("sys");
-  let off = 0;
-  if (s && s.utc_offset) off = s.utc_offset;
-  let v = t + off;
+  if (s && s.utc_offset) return s.utc_offset;
+  return 0;
+}
+
+function localDay(t) {
+  return Math.floor((t + localOffset()) / 86400);
+}
+
+function localHour(t) {
+  let v = t + localOffset();
   let d = Math.floor(v / 86400);
   let rem = v - d * 86400;
   return Math.floor(rem / 3600);
 }
 
+function isManual(t) { return ST.manualDay === localDay(t); }
+function isOpened(t) { return ST.openedDay === localDay(t); }
+
 // Release the day. Drives nothing here, only records the intent.
 // The tick then decides between day position and shading.
-function openDay(why) {
-  ST.opened = true;
-  ST.manual = false;
+function openDay(t, why) {
+  ST.openedDay = localDay(t);
+  ST.manualDay = -1;               // a wake call or sunrise wins over an override
   ST.active = false;
   ST.lastAng = 999;
   ST.pendingDay = true;
@@ -377,6 +397,10 @@ function tick() {
   let t = now();
   if (t < 1700000000) { log("no valid clock, tracking paused"); return; }
 
+  // A value restored from KVS is stamped here, on the first tick with a
+  // valid clock, not in loadState() where the clock is usually still 0.
+  if (ST.demand !== null && ST.demandTs === 0) ST.demandTs = t;
+
   let sun = sunPos(t, CFG.lat, CFG.lon);
 
   // Day/night change. Only triggered on the transition, not on every tick,
@@ -385,29 +409,29 @@ function tick() {
   if (sun.alt >= CFG.dayNightElev) isDay = true;
 
   if (ST.phase === null) {
-    ST.phase = isDay;              // on startup only remember, do not drive
+    ST.phase = isDay;              // on startup only remember the phase
   } else if (isDay !== ST.phase) {
     ST.phase = isDay;
-    ST.manual = false;
     ST.active = false;
     ST.lastAng = 999;
     if (isDay) {
       log("sunrise");
-      if (CFG.dayTrigger === "sun" && !ST.opened) openDay("sun");
-      else saveState();
     } else {
       log("sunset");
-      ST.opened = false;           // the new day for the alarm starts here
       ST.pendingDay = false;
       if (CFG.sunsetAction) drive(CFG.nightPos, CFG.nightSlat);
-      saveState();
       return;
     }
   }
 
-  // Fallback in case the alarm sent nothing (hub down, phone away)
-  if (isDay && !ST.opened && CFG.dayTrigger === "cmd") {
-    if (localHour(t) >= CFG.dayFallbackHour) openDay("fallback");
+  // Day release. Deliberately outside the transition block so that it also
+  // fires when the script starts up in the middle of a day.
+  if (isDay && !isOpened(t) && !isManual(t)) {
+    if (CFG.dayTrigger === "sun") {
+      openDay(t, "sun");
+    } else if (localHour(t) >= CFG.dayFallbackHour) {
+      openDay(t, "fallback");      // alarm never called, open anyway
+    }
   }
 
   let rel = norm180(sun.az - CFG.azimuth);
@@ -420,18 +444,19 @@ function tick() {
 
   let demand = shadingDemand(t);
   let should = false;
-  if (!ST.manual && ST.opened && demand && inSector && sun.alt >= CFG.minElev) should = true;
+  if (!isManual(t) && isOpened(t) && demand && inSector && sun.alt >= CFG.minElev) should = true;
 
   let m = "alt=" + num(Math.round(sun.alt));
   m = m + " az=" + num(Math.round(sun.az));
   m = m + " rel=" + num(Math.round(rel));
   m = m + " demand=" + num(demand);
   m = m + " sector=" + num(inSector);
-  m = m + " manual=" + num(ST.manual);
+  m = m + " manual=" + num(isManual(t));
   log(m);
 
-  // If shading is already due at wake time, the day position is skipped.
-  // Otherwise the curtain would travel up and back down seconds later.
+  // By default a pending day position is dropped when shading is already
+  // due, so the blind does not travel up and back down seconds later.
+  // wakeAlwaysOpen opts out of that and takes the extra movement.
   if (should && ST.pendingDay && CFG.wakeAlwaysOpen) {
     ST.pendingDay = false;
     drive(CFG.dayPos, CFG.daySlat);
@@ -491,12 +516,14 @@ Shelly.addStatusHandler(function (e) {
   if (src === "script") return;
   if (src === "init") return;
   if (src === "limit_switch") return;
-  if (now() - ST.selfCmd < 8) return;        // our own command
-  if (ST.manual) return;
-  ST.manual = true;
+  let t = now();
+  if (t === 0) return;                      // no clock yet, cannot date the flag
+  if (t - ST.selfCmd < 8) return;           // our own command
+  if (isManual(t)) return;
+  ST.manualDay = localDay(t);
   ST.active = false;
   ST.lastAng = 999;
-  log("manual operation (" + src + ") -> tracking paused until night");
+  log("manual operation (" + src + ") -> tracking paused until midnight");
   saveState();
 });
 
@@ -518,12 +545,13 @@ HTTPServer.registerEndpoint("demand", function (req, res) {
   let v = qval(req.query, "v");
   let changed = false;
   if (v !== null && !isNaN(v)) {
-    ST.demand = (v > 0.5);
+    let nv = (v > 0.5);
+    if (nv !== ST.demand) changed = true;   // only a real flip needs a cycle
+    ST.demand = nv;
     ST.demandTs = now();
-    changed = true;
-    saveState();                  // writes only if the value actually flipped
+    saveState();                            // writes only on an actual change
   }
-  let o = { demand: ST.demand, active: ST.active, manual: ST.manual };
+  let o = { demand: ST.demand, active: ST.active, manual: isManual(now()) };
   res.code = 200;
   res.body = JSON.stringify(o);
   res.send();
@@ -533,9 +561,12 @@ HTTPServer.registerEndpoint("demand", function (req, res) {
 // Wake call: releases the day and lets the tick decide what to drive.
 //   http://<shelly-ip>/script/1/wake
 HTTPServer.registerEndpoint("wake", function (req, res) {
+  let t = now();
   let fresh = false;
-  if (!ST.opened) { openDay("alarm"); fresh = true; }
-  let o = { opened: ST.opened, demand: ST.demand, manual: ST.manual };
+  // isOpened() is day-stamped, so a stray call after sunset is ignored: the
+  // day was already released this morning. A call before sunrise still works.
+  if (t > 1700000000 && !isOpened(t)) { openDay(t, "alarm"); fresh = true; }
+  let o = { opened: (t > 0 && isOpened(t)), demand: ST.demand, manual: (t > 0 && isManual(t)) };
   res.code = 200;
   res.body = JSON.stringify(o);
   res.send();
