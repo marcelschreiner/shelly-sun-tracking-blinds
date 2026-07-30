@@ -12,7 +12,7 @@ Tested on Shelly Gen2 and newer in the Cover profile.
 - Slat angle from slat width, slat distance and window orientation
 - Tracking in a configurable angular step, with a minimum pause between movements
 - Day and night positions, triggered either by sunrise or by an external wake call
-- Manual operation pauses the automation for the rest of the local day
+- Manual operation during the day pauses the automation for the rest of the local day
 - Heat demand supplied from outside as a plain yes/no over HTTP
 - Layered fallbacks for network, hub or time server failures
 
@@ -119,6 +119,11 @@ reboot without going stale. A side effect worth knowing: a wake call after sunse
 ignored, because the day was already released that morning, while a wake call before
 sunrise still works, which is what a winter alarm needs.
 
+Because the override expires at midnight and not at sunrise, a manual command in the
+dark would block the entire coming day, day position included. Manual operation below
+`dayNightElev` therefore does not pause the automation at all. Whoever adjusts the
+blind at three in the morning gets the normal day back a few hours later.
+
 If the wake call arrives while shading is already due, the day position is skipped and
 the blind goes straight to the shading position. Otherwise it would travel up and back
 down seconds later.
@@ -171,11 +176,13 @@ rounding absorbs it, unlike the mechanical scatter of the blind itself.
 | `slatWidth` / `slatDist` | `70` / `60` | Slat width and distance in mm |
 | `angAtPos0` / `angAtPos100` | `80` / `-10` | Measured end position angles, see calibration |
 | `stepDeg` | `15` | Angular step of the tracking |
-| `intervalMin` | `20` | Minimum pause between two movements |
+| `intervalMin` | `20` | Minimum pause between two movements, start and end included |
+| `selfCmdSec` | `90` | Window in which a cover report still counts as our own command |
 | `mode` | `1` | 0 = maximum daylight, 1 = maximum cooling |
 | `coolExtra` | `20` | Extra degrees towards closed in mode 1 |
 | `shadePos` | `0` | Curtain position while shading |
 | `endAction` | `1` | 0=nothing, 1=open, 2=close, 3=slats horizontal |
+| `endSkipDeg` | `8` | End action is skipped this close to `dayNightElev`, keep above `minElev` |
 | `dayTrigger` | `"cmd"` | `"sun"` = sunrise, `"cmd"` = wait for a wake call |
 | `dayFallbackHour` | `9` | Local hour at which the blind opens without a wake call |
 | `wakeAlwaysOpen` | `false` | `true` = always fully open on wake |
