@@ -43,7 +43,12 @@ let CFG = {
   angAtPos0: 80,         // measured angle at slat_pos = 0
   angAtPos100: -10,      // measured angle at slat_pos = 100
   stepDeg: 15,           // tracking granularity
-  intervalMin: 20,       // minimum pause between two movements
+  intervalMin: 20,       // minimum pause between two movements, also between
+                         // start, end and restart of the tracking
+  selfCmdSec: 90,        // a cover report within this window after our own
+                         // command is ours, not the user. Must cover the full
+                         // travel time of the blind, the report only arrives
+                         // once the motor has stopped.
 
   mode: 1,               // 0 = maximum daylight, 1 = maximum cooling
   coolExtra: 20,         // extra degrees towards closed in mode 1
@@ -52,6 +57,10 @@ let CFG = {
   // 100 = fully up. After that only the slat angle is tracked.
   shadePos: 0,
   endAction: 1,          // 0=nothing, 1=open, 2=close, 3=slats horizontal
+  endSkipDeg: 8,         // no end action once the sun is this close to
+                         // dayNightElev, the sunset action follows anyway.
+                         // Keep it above minElev, otherwise the evening exit
+                         // by elevation still opens the blind for minutes.
 
   // --- Day boundaries. Replaces the schedules in the smart home app so
   // that no second controller writes to the same cover.
@@ -256,6 +265,18 @@ function angleToSlatPos(ang) {
   return Math.round(p);
 }
 
+// True when the angle lies between the two calibration points. Outside them
+// angleToSlatPos() clamps, several angles collapse onto the same position and
+// the blind cannot follow the sun any further.
+function angleReachable(ang) {
+  let lo = CFG.angAtPos0;
+  let hi = CFG.angAtPos100;
+  if (lo > hi) { let x = lo; lo = hi; hi = x; }
+  if (ang < lo) return false;
+  if (ang > hi) return false;
+  return true;
+}
+
 // ============================================================
 // State
 //
@@ -266,10 +287,14 @@ function angleToSlatPos(ang) {
 // manualDay and openedDay hold the local day number on which the flag was
 // set. Comparing against today makes both expire at local midnight on their
 // own, and makes them survive a reboot without going stale.
+let T_VALID = 1700000000;   // below this the device clock is not in sync yet
+
 let ST = {
   manualDay: -1,       // day on which manual operation was detected
   active: false,       // tracking is currently running
   lastAng: 999,
+  lastSlat: -1,        // slat_pos last commanded by the tracking, -1 = none
+  lastPos: -1,         // cover position last commanded by the tracking
   lastMove: 0,
   selfCmd: 0,          // timestamp of our own last movement command
   demand: null,        // true = too warm, false = fine, null = never reported
@@ -287,28 +312,51 @@ function now() {
   return 0;
 }
 
+// Every RPC gets this callback. Without one a failed call is invisible, and
+// the script would keep believing the blind followed its command.
+function rpcDone(res, err, msg) {
+  if (err === 0) return;
+  let m = "RPC failed, code " + num(err);
+  if (msg) m = m + ": " + msg;
+  log(m);
+}
+
 function saveState() {
   let o = { md: ST.manualDay, d: ST.demand, od: ST.openedDay };
   let s = JSON.stringify(o);
   if (s === saved) return;           // unchanged -> no flash access
   saved = s;
-  Shelly.call("KVS.Set", { key: "shade_state", value: s });
+  Shelly.call("KVS.Set", { key: "shade_state", value: s }, rpcDone);
   log("saved: " + s);
 }
 
+// Anything coming out of flash is treated as foreign input. mJS has no
+// exceptions, so a value from an older version or a half written record must
+// not reach JSON.parse unchecked, otherwise the script dies at startup and
+// nothing shades at all until someone restarts it by hand.
 function loadState() {
   Shelly.call("KVS.Get", { key: "shade_state" }, function (res, err) {
     if (err !== 0) { log("no stored state"); return; }
     if (!res) return;
-    saved = res.value;
-    let v = JSON.parse(res.value);
-    if (v.md !== undefined) ST.manualDay = v.md;
-    if (v.od !== undefined) ST.openedDay = v.od;
-    ST.demand = v.d;
+    let s = res.value;
+    if (typeof s !== "string") { log("stored state not a string, ignored"); return; }
+    let head = s.slice(0, 1);
+    let tail = s.slice(s.length - 1);
+    if (head !== "{" || tail !== "}") { log("stored state malformed, ignored"); return; }
+    let v = JSON.parse(s);
+    if (!v) { log("stored state unreadable, ignored"); return; }
+    saved = s;
+    if (typeof v.md === "number") ST.manualDay = v.md;
+    if (typeof v.od === "number") ST.openedDay = v.od;
+    // Only a real boolean counts. Anything else stays null, otherwise
+    // shadingDemand() would treat an undefined as a fresh report and skip the
+    // seasonal fallback for a whole demandMaxAgeH.
+    if (v.d === true || v.d === false) ST.demand = v.d;
+    else ST.demand = null;
     // demandTs stays 0 on purpose. The clock is usually not in sync yet at
     // this point, so now() would return 0 and the value would immediately
     // count as expired. tick() stamps it once the clock is valid.
-    log("state restored: " + res.value);
+    log("state restored: " + s);
   });
 }
 
@@ -337,30 +385,55 @@ function drive(pos, slatPos) {
   ST.selfCmd = now();
   // Position and slats must be sent in ONE call, otherwise the second
   // command overrides the first.
-  Shelly.call("Cover.GoToPosition", p);
+  Shelly.call("Cover.GoToPosition", p, rpcDone);
   let m = "drive pos=" + num(pos);
   m = m + " slat=" + num(slatPos);
   log(m);
 }
 
-function runEndAction() {
+// Everything the tracking remembers about its last movement. Called wherever
+// the tracking is dropped, so no stale value can suppress the next command.
+function resetTracking() {
+  ST.active = false;
+  ST.lastAng = 999;
+  ST.lastSlat = -1;
+  ST.lastPos = -1;
+}
+
+function runEndAction(t, alt) {
+  // Right before the day/night switch the sunset action follows within
+  // minutes. Opening fully here would mean two full travels for nothing.
+  if (CFG.sunsetAction) {
+    let near = CFG.dayNightElev + CFG.endSkipDeg;
+    if (alt < near) { log("tracking ended, end action skipped, sunset is near"); return; }
+  }
   if (CFG.endAction === 1) {
-    ST.selfCmd = now();
-    Shelly.call("Cover.Open", { id: CFG.coverId });
+    ST.selfCmd = t;
+    ST.lastMove = t;
+    Shelly.call("Cover.Open", { id: CFG.coverId }, rpcDone);
   } else if (CFG.endAction === 2) {
-    ST.selfCmd = now();
-    Shelly.call("Cover.Close", { id: CFG.coverId });
+    ST.selfCmd = t;
+    ST.lastMove = t;
+    Shelly.call("Cover.Close", { id: CFG.coverId }, rpcDone);
   } else if (CFG.endAction === 3) {
+    ST.lastMove = t;
     drive(CFG.shadePos, angleToSlatPos(0));
   }
   log("tracking ended, end action " + num(CFG.endAction));
 }
 
 // Local time from device time. utc_offset also covers daylight saving.
-// Without it the device falls back to UTC, which shifts dayFallbackHour.
+// Without it the device falls back to UTC, which shifts dayFallbackHour and
+// moves the midnight rollover of both day flags, so it is worth a warning.
+let warnedOffset = false;
+
 function localOffset() {
   let s = Shelly.getComponentStatus("sys");
-  if (s && s.utc_offset) return s.utc_offset;
+  if (s && s.utc_offset !== undefined) return s.utc_offset;
+  if (!warnedOffset) {
+    warnedOffset = true;
+    log("WARNING: no utc_offset from the device, running on UTC");
+  }
   return 0;
 }
 
@@ -383,8 +456,7 @@ function isOpened(t) { return ST.openedDay === localDay(t); }
 function openDay(t, why) {
   ST.openedDay = localDay(t);
   ST.manualDay = -1;               // a wake call or sunrise wins over an override
-  ST.active = false;
-  ST.lastAng = 999;
+  resetTracking();
   ST.pendingDay = true;
   log("day released (" + why + ")");
   saveState();
@@ -395,7 +467,7 @@ function openDay(t, why) {
 // ============================================================
 function tick() {
   let t = now();
-  if (t < 1700000000) { log("no valid clock, tracking paused"); return; }
+  if (t < T_VALID) { log("no valid clock, tracking paused"); return; }
 
   // A value restored from KVS is stamped here, on the first tick with a
   // valid clock, not in loadState() where the clock is usually still 0.
@@ -412,8 +484,7 @@ function tick() {
     ST.phase = isDay;              // on startup only remember the phase
   } else if (isDay !== ST.phase) {
     ST.phase = isDay;
-    ST.active = false;
-    ST.lastAng = 999;
+    resetTracking();
     if (isDay) {
       log("sunrise");
     } else {
@@ -463,12 +534,19 @@ function tick() {
     return;                        // shading follows on the next tick
   }
 
+  let pause = CFG.intervalMin * 60;
+  let due = false;
+  if (t - ST.lastMove >= pause) due = true;
+
   if (!should) {
     if (ST.active) {
-      ST.active = false;
-      ST.lastAng = 999;
+      // The pause applies to the end of the tracking as well. A heat demand
+      // toggling around its threshold would otherwise drive the blind fully
+      // up and down on every flip. Not due yet means: try again next tick.
+      if (!due) { log("end action delayed, pause not over"); return; }
       ST.pendingDay = false;
-      runEndAction();
+      resetTracking();
+      runEndAction(t, sun.alt);
     } else if (ST.pendingDay) {
       ST.pendingDay = false;
       drive(CFG.dayPos, CFG.daySlat);
@@ -484,23 +562,40 @@ function tick() {
   let k = Math.ceil(ang / CFG.stepDeg);
   ang = k * CFG.stepDeg;
 
-  let started = !ST.active;
-  let due = false;
-  if (t - ST.lastMove >= CFG.intervalMin * 60) due = true;
-  let changed = false;
-  if (abs(ang - ST.lastAng) >= CFG.stepDeg) changed = true;
+  let sp = null;
+  if (CFG.slats) sp = angleToSlatPos(ang);
 
-  if (started || (due && changed)) {
-    ST.active = true;
-    ST.lastAng = ang;
-    ST.lastMove = t;
-    let m2 = "profile=" + num(Math.round(prof));
-    m2 = m2 + " -> slat angle=" + num(ang);
-    log(m2);
-    let sp = null;
-    if (CFG.slats) sp = angleToSlatPos(ang);
-    drive(CFG.shadePos, sp);
+  // The pause also gates the start, otherwise a flipping demand would restart
+  // the tracking seconds after the end action.
+  if (!due) return;
+
+  // Compare what is actually commanded, not the raw angle. Beyond the
+  // calibration points many angles map to the same slat_pos, and comparing
+  // angles kept re-sending a command the blind had already executed.
+  let changed = false;
+  if (CFG.slats) {
+    if (sp !== ST.lastSlat) changed = true;
+  } else if (CFG.shadePos !== ST.lastPos) {
+    changed = true;
   }
+
+  let started = !ST.active;
+  if (!started && !changed) return;
+
+  ST.active = true;
+  ST.lastAng = ang;
+  ST.lastSlat = sp;
+  ST.lastPos = CFG.shadePos;
+  ST.lastMove = t;
+  let m2 = "profile=" + num(Math.round(prof));
+  m2 = m2 + " -> slat angle=" + num(ang);
+  log(m2);
+  if (CFG.slats && !angleReachable(ang)) {
+    let m3 = "angle " + num(ang) + " outside the calibrated range, clamped to slat_pos ";
+    m3 = m3 + num(sp);
+    log(m3);
+  }
+  drive(CFG.shadePos, sp);
 }
 
 // ============================================================
@@ -513,16 +608,26 @@ Shelly.addStatusHandler(function (e) {
   if (!e.delta) return;
   if (e.delta.source === undefined) return;
   let src = e.delta.source;
-  if (src === "script") return;
+  if (typeof src !== "string") return;
+  if (src.indexOf("script") === 0) return;  // "script", "script:1", ...
   if (src === "init") return;
   if (src === "limit_switch") return;
   let t = now();
-  if (t === 0) return;                      // no clock yet, cannot date the flag
-  if (t - ST.selfCmd < 8) return;           // our own command
+  if (t < T_VALID) return;                  // no clock yet, cannot date the flag
+  // Our own command. The cover only reports once the motor has stopped, so
+  // this window has to cover the full travel time of the blind.
+  if (t - ST.selfCmd < CFG.selfCmdSec) return;
   if (isManual(t)) return;
+  // A manual command in the dark must not consume the coming day. The flag
+  // expires at local midnight, so anything touched between midnight and
+  // sunrise would otherwise block the whole day, day position included.
+  let sun = sunPos(t, CFG.lat, CFG.lon);
+  if (sun.alt < CFG.dayNightElev) {
+    log("manual operation (" + src + ") at night, automation not paused");
+    return;
+  }
   ST.manualDay = localDay(t);
-  ST.active = false;
-  ST.lastAng = 999;
+  resetTracking();
   log("manual operation (" + src + ") -> tracking paused until midnight");
   saveState();
 });
@@ -565,7 +670,7 @@ HTTPServer.registerEndpoint("wake", function (req, res) {
   let fresh = false;
   // isOpened() is day-stamped, so a stray call after sunset is ignored: the
   // day was already released this morning. A call before sunrise still works.
-  if (t > 1700000000 && !isOpened(t)) { openDay(t, "alarm"); fresh = true; }
+  if (t >= T_VALID && !isOpened(t)) { openDay(t, "alarm"); fresh = true; }
   let o = { opened: (t > 0 && isOpened(t)), demand: ST.demand, manual: (t > 0 && isManual(t)) };
   res.code = 200;
   res.body = JSON.stringify(o);
@@ -576,10 +681,24 @@ HTTPServer.registerEndpoint("wake", function (req, res) {
 // ============================================================
 // Startup
 // ============================================================
+// The values that would otherwise fail silently: a zero slat width divides by
+// zero, two identical calibration points make every angle map to the same
+// position. Both leave a running script that simply never shades correctly.
+function checkConfig() {
+  if (CFG.slatWidth <= 0) log("CONFIG ERROR: slatWidth must be greater than 0");
+  if (CFG.slatDist <= 0) log("CONFIG ERROR: slatDist must be greater than 0");
+  if (CFG.angAtPos0 === CFG.angAtPos100) log("CONFIG ERROR: angAtPos0 and angAtPos100 are identical, calibration missing");
+  if (CFG.stepDeg <= 0) log("CONFIG ERROR: stepDeg must be greater than 0");
+  if (CFG.tolEnd < CFG.tolStart) log("CONFIG WARNING: tolEnd below tolStart, the sector edge can flap");
+  if (CFG.lat > 90 || CFG.lat < -90) log("CONFIG ERROR: lat outside -90..90");
+  if (CFG.lon > 180 || CFG.lon < -180) log("CONFIG ERROR: lon outside -180..180");
+}
+
 function init() {
   let m = "location " + num(CFG.lat);
   m = m + " / " + num(CFG.lon);
   log(m);
+  checkConfig();
   loadState();
   Timer.set(CFG.tickSec * 1000, true, tick);
   Timer.set(15000, false, tick);   // first run once the clock is in sync
