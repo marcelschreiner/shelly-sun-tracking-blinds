@@ -4,17 +4,17 @@
 //
 //   node test/run.js
 //
-// Every case under day release, manual override, wake call and the window
-// contact corresponds to a bug that was found and fixed, so the same mistake
-// cannot come back unnoticed.
+// Every case under day release, manual override and wake call corresponds to
+// a bug that was found and fixed, so the same mistake cannot come back
+// unnoticed.
 // ============================================================
 const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
 
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'shading.js'), 'utf8')
-  + '\nglobalThis.__x = { ST: ST, CFG: CFG, tick: tick, windowOpen: windowOpen,'
-  + ' sunPos: sunPos, localDay: localDay };';
+  + '\nglobalThis.__x = { ST: ST, CFG: CFG, tick: tick, sunPos: sunPos, localDay: localDay,'
+  + ' windowOpen: windowOpen, angleToSlatPos: angleToSlatPos };';
 
 let T = 0;            // virtual clock, unix seconds
 let drives = [];      // every cover command the script issued
@@ -74,6 +74,9 @@ const NOON = D(11, 22);       // sun due south, 66 degrees up
 const MORNING = D(5, 0);      // 07:00 local, sun up, before dayFallbackHour
 const EVENING = D(20, 30);    // after sunset
 const NIGHT = D(1, 0);        // 03:00 local, deep night
+// Low winter sun inside the sector: the regular angle lands at 75 degrees,
+// above windowAng, so the cap has something to bite on.
+const WINTER = Date.UTC(2025, 11, 21, 9, 0, 0) / 1000;
 
 // ============================================================
 group('solar position');
@@ -140,81 +143,120 @@ manual('script:1');
 check('the script itself is not manual', X.ST.manualDay === -1);
 
 // ============================================================
-group('window contact');
-kvs = null; X = boot();
-at(NOON);
-check('no contact reported, shading unaffected', drives.length === 1 && drives[0].p.pos === 0);
-check('state is null, not false', X.ST.window === null);
-
-let r = ep('window', 'v=1');
-check('endpoint reports open', r.window_open === true, JSON.stringify(r));
-check('persisted to flash', String(kvs).indexOf('"w":true') > -1, String(kvs));
-at(NOON + 1800);
-check('no downward command', !drives.some(d => d.p && d.p.pos === 0), JSON.stringify(drives));
-check('blind sent up instead (endAction=open)', drives.length === 1 && drives[0].m === 'Cover.Open', JSON.stringify(drives));
-
-drives = [];
-ep('window', 'v=0');
-check('pause still gates the restart', drives.length === 0, JSON.stringify(drives));
-at(NOON + 3200);
-check('shading resumes once the pause is over', drives.length === 1 && drives[0].p.pos === 0, JSON.stringify(drives));
-
-group('window contact, sunset');
-ep('window', 'v=1');
-at(EVENING);
-check('night position held back', drives.length === 0, JSON.stringify(drives));
-check('pendingNight set', X.ST.pendingNight === true);
-drives = [];
-ep('window', 'v=0');
-check('driven as soon as the window closes', drives.length === 1 && drives[0].p.pos === 0, JSON.stringify(drives));
-check('pendingNight cleared', X.ST.pendingNight === false);
-
-group('window contact, end actions');
+group('end actions');
 // Each variant needs its own boot. Once the tracking has ended it stays
 // ended, so reusing one instance would test nothing at all.
-function endAction(kind, openWindow) {
+function endAction(kind) {
   kvs = null;
   X = boot();
   at(NOON);
   if (X.ST.active !== true) return 'shading never started';
   X.CFG.endAction = kind;
-  if (openWindow) ep('window', 'v=1');
-  else ep('demand', 'v=0');    // end the tracking the ordinary way
+  ep('demand', 'v=0');         // end the tracking the ordinary way
   drives = [];
   at(NOON + 1800);
   return drives;
 }
-let d = endAction(2, true);
-check('window open: close is suppressed', d.length === 0, JSON.stringify(d));
-d = endAction(3, true);
-check('window open: slats-horizontal is suppressed', d.length === 0, JSON.stringify(d));
-d = endAction(1, true);
-check('window open: open still runs, it travels up', d.length === 1 && d[0].m === 'Cover.Open', JSON.stringify(d));
-// The guard must not fire when the window is shut, or it would block everything.
-d = endAction(2, false);
-check('window shut: close runs as before', d.length === 1 && d[0].m === 'Cover.Close', JSON.stringify(d));
-d = endAction(3, false);
-check('window shut: slats-horizontal runs as before', d.length === 1 && d[0].p.pos === 0, JSON.stringify(d));
+let d = endAction(1);
+check('endAction=open sends the blind up', d.length === 1 && d[0].m === 'Cover.Open', JSON.stringify(d));
+d = endAction(2);
+check('endAction=close sends it down', d.length === 1 && d[0].m === 'Cover.Close', JSON.stringify(d));
+d = endAction(3);
+check('endAction=slats-horizontal drives shadePos', d.length === 1 && d[0].p.pos === 0, JSON.stringify(d));
+d = endAction(0);
+check('endAction=nothing drives nothing', d.length === 0, JSON.stringify(d));
+
+// ============================================================
+group('window contact, the slat cap');
+kvs = null; X = boot();
+const steep = X.angleToSlatPos(75);
+const capped = X.angleToSlatPos(X.CFG.windowAng);
+T = WINTER;
+drives = [];
+ep('demand', 'v=1');           // outside fallbackMonths in December, and this ticks
+check('shading runs on the low winter sun', X.ST.active === true);
+check('no contact reported, regular angle commanded', drives.length === 1 && drives[0].p.slat_pos === steep,
+      JSON.stringify(drives) + ' expected slat_pos ' + steep);
+
+drives = [];
+let r = ep('window', 'v=1');
+check('endpoint reports open', r.window_open === true, JSON.stringify(r));
+check('opening drives at once, it does not wait out intervalMin', drives.length === 1, JSON.stringify(drives));
+check('slats capped towards open', drives.length === 1 && drives[0].p.slat_pos === capped,
+      JSON.stringify(drives) + ' expected slat_pos ' + capped);
+check('the curtain position is untouched', drives.length === 1 && drives[0].p.pos === X.CFG.shadePos);
+
+drives = [];
+ep('window', 'v=0');
+check('closing returns to the regular angle', drives.length === 1 && drives[0].p.slat_pos === steep,
+      JSON.stringify(drives));
+
+group('window contact, the report expires');
+// A contact only speaks when it changes, so the age has to outlast a long
+// airing. Past windowMaxAgeH the report counts as lost and the cap is dropped.
+kvs = null; X = boot();
+X.CFG.demandMaxAgeH = 9999;    // isolate the window, or the heat demand
+                               // expires first and December stops shading
+const steep2 = X.angleToSlatPos(75);
+const capped2 = X.angleToSlatPos(X.CFG.windowAng);
+T = WINTER;
+drives = [];
+ep('demand', 'v=1');
+ep('window', 'v=1');
+check('capped right after the report', drives[drives.length - 1].p.slat_pos === capped2, JSON.stringify(drives));
+
+const age = X.CFG.windowMaxAgeH * 3600;
+at(WINTER + age - 3600);       // one hour short of the limit
+check('still capped an hour before the limit', X.windowOpen(T) === true);
+
+drives = [];
+at(WINTER + age + 60);         // just past it
+check('the report counts as lost', X.windowOpen(T) === false);
+check('back to the regular angle', drives.length === 1 && drives[0].p.slat_pos === steep2,
+      JSON.stringify(drives) + ' expected slat_pos ' + steep2);
+
+drives = [];
+ep('window', 'v=1');           // the contact speaks up again
+check('a fresh report caps again', drives.length === 1 && drives[0].p.slat_pos === capped2,
+      JSON.stringify(drives));
+
+group('window contact, cap that does not bind');
+kvs = null; X = boot();
+at(NOON);                      // high summer sun, slats already flat
+const flat = drives[0].p.slat_pos;
+drives = [];
+ep('window', 'v=1');
+check('already flat enough, no command at all', drives.length === 0, JSON.stringify(drives));
+at(NOON + 3600);
+check('and none on the next tick either', drives.length === 0, JSON.stringify(drives));
+check('window is open all the same', X.windowOpen(T) === true);
+check('the flat angle is below the cap', flat === X.angleToSlatPos(-15));
 
 // ============================================================
 group('reboot');
-kvs = JSON.stringify({ md: -1, d: null, od: -1, w: true });
+kvs = JSON.stringify({ md: -1, d: true, od: -1 });
 let Y = boot();
+check('heat demand restored', Y.ST.demand === true, 'demand=' + Y.ST.demand);
+check('demandTs stays 0 until the first valid tick', Y.ST.demandTs === 0);
+
+kvs = JSON.stringify({ md: -1, d: 'yes', od: -1 });
+Y = boot();
+check('non-boolean demand falls back to null', Y.ST.demand === null, 'demand=' + Y.ST.demand);
+
+kvs = JSON.stringify({ md: -1, d: null, od: -1, w: true });
+Y = boot();
 check('window state restored as open', Y.ST.window === true, 'window=' + Y.ST.window);
-check('still blocking after the reboot', Y.windowOpen() === true);
+check('windowTs stays 0 until the first valid tick', Y.ST.windowTs === 0);
+T = WINTER; Y.tick();
+check('and is stamped there, not at restore time', Y.ST.windowTs === WINTER, 'ts=' + Y.ST.windowTs);
 
 kvs = JSON.stringify({ md: -1, d: null, od: -1 });
 Y = boot();
 check('a record without w loads, window stays null', Y.ST.window === null, 'window=' + Y.ST.window);
 
-kvs = JSON.stringify({ md: -1, d: 'yes', od: -1, w: 'open' });
-Y = boot();
-check('non-boolean demand falls back to null', Y.ST.demand === null, 'demand=' + Y.ST.demand);
-check('non-boolean window falls back to null', Y.ST.window === null, 'window=' + Y.ST.window);
-
 kvs = 'not json at all';
 Y = boot();
-check('a malformed record does not kill the script', Y.ST.window === null && Y.ST.demand === null);
+check('a malformed record does not kill the script', Y.ST.demand === null && Y.ST.window === null);
 
 // ============================================================
 group('demand');

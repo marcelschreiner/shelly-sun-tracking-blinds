@@ -12,7 +12,7 @@ Autonomous blind control as a Shelly script. The device computes the solar posit
 | **Sun position** | computed on the device, from clock and coordinates | sets the slat angle |
 | **Room temperature** | your smart home, via `/demand` | whether to shade at all |
 | **Alarm clock** | your smart home, via `/wake` | releases the day, blind opens |
-| **Window contact** | your smart home, via `/window` | blocks any downward travel |
+| **Window contact** | your smart home, via `/window` | keeps a gap in the slats for the air |
 | **Manual operation** | the button, app or web interface | pauses automation until midnight |
 
 Only the sun position is required. Every other input is optional, has a fallback, and reaches the device as a plain yes/no over HTTP. The Shelly stays the only controller: **no schedule on your smart home platform may write to the same cover**, or the script cannot tell an automation from a manual command and locks itself out for the day.
@@ -74,6 +74,7 @@ All settings are located in the `CFG` block at the top of the script.
 | `shadePos` | Curtain position while shading | % | 0…100 | `0` |
 | `endAction` | 0=nothing, 1=open, 2=close, 3=slats horizontal | — | 0…3 | `1` |
 | `endSkipDeg` | End action skipped this close to `dayNightElev`, keep above `minElev` | ° | ≥ 0 | `8` |
+| `windowAng` | Maximum slat angle while the window is open. Lower = more air, less shade | ° | 0…90 | `60` |
 
 ### Day and night
 
@@ -87,12 +88,13 @@ All settings are located in the `CFG` block at the top of the script.
 | `nightPos` / `nightSlat` | Night position | % | 0…100 | `0` / `0` |
 | `dayNightElev` | Day/night switch. Negative closes later, `-4` ≈ civil twilight | ° | −18…90 | `0` |
 
-### Heat demand and system
+### Reports and system
 
 | Parameter | Meaning | Unit | Range | Default |
 |---|---|---|---|---|
 | `demandMaxAgeH` | Age at which the heat demand counts as lost | h | > 0 | `24` |
 | `fallbackMonths` | Months that shade without a valid demand | — | 1…12 | `[4..9]` |
+| `windowMaxAgeH` | Age at which the window report counts as lost and the cap is dropped | h | > 0 | `72` |
 | `tickSec` | Cycle time | s | > 0 | `300` |
 | `selfCmdSec` | Window in which a cover report still counts as our own command | s | ≥ 0 | `90` |
 | `debug` | Output to the script console | — | true / false | `true` |
@@ -113,10 +115,10 @@ Each one answers with the current state as JSON and triggers a cycle immediately
 
 ## Smart home integration
 
-Examples are Apple Home; the principle holds anywhere. Join the Shelly over Matter and drive the endpoints from your automations.
+Examples are Apple Home; the principle holds anywhere. Join the Shelly to your Smart home system of choice and drive the endpoints from your automations.
 
 <details>
-<summary><b>Room temperature</b></summary>
+<summary><b>Room temperature automation</b></summary>
 <br>
 
 Two automations per room: above the upper threshold call `demand?v=1`, below the lower one `demand?v=0`. The hysteresis therefore lives in the app and can differ per room. In Apple Home use *Convert to Shortcut* and *Get Contents of URL*, which runs on the home hub without a phone.
@@ -125,16 +127,16 @@ Two automations per room: above the upper threshold call `demand?v=1`, below the
 </details>
 
 <details>
-<summary><b>Window contact</b></summary>
+<summary><b>Window contact automation</b></summary>
 <br>
 
-One automation per window, opened and closed. Call `/script/1/window?v=1` when the window was opened `/script/1/window?v=0` when closed
+One automation per window: call `/script/1/window?v=1` when it opens and `?v=0` when it closes. Any contact the platform can read will do.
 
 <br>
 </details>
 
 <details>
-<summary><b>Alarm clock</b></summary>
+<summary><b>Alarm clock automation</b></summary>
 <br>
 
 A personal shortcut automation on *When my alarm is stopped*, calling `/wake`, with *Ask Before Running* off. This one runs on the phone; a fixed-time home automation works too but loses the link to the actual alarm.
@@ -149,8 +151,7 @@ A personal shortcut automation on *When my alarm is stopped*, calling `/wake`, w
 <summary><b>Solar position</b></summary>
 <br>
 
-NOAA approximation from the device unix time, below 0.01 degrees of
-error, verified against the theoretical solstice elevations.
+NOAA approximation from the device unix time, below 0.01 degrees of error, verified against the theoretical solstice elevations.
 
 <br>
 </details>
@@ -159,10 +160,7 @@ error, verified against the theoretical solstice elevations.
 <summary><b>Slat angle</b></summary>
 <br>
 
-The profile angle `p` is the sun's apparent angle in the window plane,
-from `h` (elevation) and `γ` (azimuth minus window orientation). The cut-off angle `β`
-is the flattest slat angle that still shades, see the
-[diagram](#slats-and-tracking) above:
+The profile angle `p` is the sun's apparent angle in the window plane, from `h` (elevation) and `γ` (azimuth minus window orientation). The cut-off angle `β` is the flattest slat angle that still shades, see the [diagram](#slats-and-tracking) above:
 
 ```
 p = atan( tan(h) / cos(γ) )      sin(β + p) = (d / w) · cos(p)
@@ -178,9 +176,7 @@ it can reach.
 <summary><b>Rounding</b></summary>
 <br>
 
-Always towards closed, in steps of `stepDeg`. Rounding to the nearest
-step would let a stripe of sun through on every second step; rounding one way also
-leaves half a step of margin for the mechanical play of the blind.
+Always towards closed, in steps of `stepDeg`. Rounding to the nearest step would let a stripe of sun through on every second step; rounding one way also leaves half a step of margin for the mechanical play of the blind.
 
 <br>
 </details>
@@ -189,26 +185,27 @@ leaves half a step of margin for the mechanical play of the blind.
 <summary><b>When it shades</b></summary>
 <br>
 
-Only when all of it holds: no manual override, day released, heat
-demand active, window closed, sun inside the sector and above `minElev`.
+Only when all of it holds: no manual override, day released, heat demand active, sun inside the sector and above `minElev`.
 
 <br>
 </details>
 
-### Window guard
+<details>
+<summary><b>Window contact</b></summary>
+<br>
 
-A blind travelling down into a tilted casement runs its bottom rail into the frame or
-the handle. While the window is open, no command that lowers the blind is issued:
+Optional. While the window is reported open, the slat angle is capped at `windowAng`, so a gap stays for the air to pass.
 
-- shading does not start, and a running tracking ends
-- the sunset position is held back, then driven as soon as the window closes
-- of the end actions only `endAction: 1` still runs, because it travels up
+It is only a cap, never a command of its own. When the sun already calls for a flatter angle, or the blind is up and not shading at all, nothing changes. It also rides along with the rest of the automation, so a manual override still wins. Closing the window returns to the regular angle at once, without waiting out `intervalMin`. A contact that was never reported caps nothing.
 
-Upward movements stay allowed. A contact that was never reported blocks nothing, so a
-setup without one behaves as before. If you set `dayPos` to something other than fully
-up, that movement is not gated.
+A contact speaks only when it changes, so silence is normal while a window stays open. Only after `windowMaxAgeH` is the report treated as lost and the cap dropped, which is why that value has to outlast the longest airing rather than the longest silence.
 
-### Day cycle
+<br>
+</details>
+
+<details>
+<summary><b>Day cycle</b></summary>
+<br>
 
 ```mermaid
 stateDiagram-v2
@@ -236,6 +233,9 @@ consequences:
 - Manual operation below `dayNightElev` does not pause anything. Otherwise adjusting the blind at three in the morning would block the whole coming day.
 - A wake call while shading is already due skips the day position, instead of travelling up and back down seconds later.
 
+<br>
+</details>
+
 
 ## Autonomy
 
@@ -247,9 +247,9 @@ The script is designed to run as autonomously as possible. These failure cases a
 | Heat demand older than `demandMaxAgeH` | Falls back to `fallbackMonths`, the season decides |
 | No wake call arrives | Opens at `dayFallbackHour` at the latest |
 | Power loss | Override, heat demand, day release and window state restored from KVS |
-| Clock synchronises late after boot | Restored heat demand is stamped on the first valid tick |
+| Clock synchronises late after boot | Restored heat demand and window state are stamped on the first valid tick |
 | No valid clock after boot | Tracking pauses instead of driving to a wrong position |
-| Window contact stops reporting while open | Blind stays up. No season to fall back on, so it errs towards not moving; `window?v=0` clears it |
+| Window report older than `windowMaxAgeH` | Cap is dropped, the slats go back to the regular angle |
 
 
 ## Notes on the code
@@ -277,7 +277,7 @@ Only `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`, `pow`, `exp`, `log` a
 
 `shading.js` runs unmodified under node, against a stub of the Shelly runtime and a virtual clock.
 
-Covers the solar position against the theoretical solstice elevations, the day release, manual override and wake behaviour, the window guard, what survives a reboot, and the flash write budget.
+Covers the solar position against the theoretical solstice elevations, the day release, manual override and wake behaviour, the end actions, the window cap and its expiry, what survives a reboot, and the flash write budget.
 
 ```bash
 node test/run.js
