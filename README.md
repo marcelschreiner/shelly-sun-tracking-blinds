@@ -30,76 +30,78 @@ cannot tell an automation from a manual command and locks itself out for the day
 5. Run the [calibration](#calibration)
 6. Start the script and enable *Run on startup*
 
-The `1` in the endpoint URLs is the script ID on the device.
-
 ## Calibration
 
-The one step that cannot be computed.
+The one step that cannot be computed. Two values must be measured, the slat angle at
+each end of the tilt travel:
+
+- `angAtPos0` — the angle at `slat_pos` 0
+- `angAtPos100` — the angle at `slat_pos` 100
 
 <img src="docs/calibration.svg" alt="Slat angle at both mechanical end positions" width="620">
 
-`slat_pos` is a percentage of the tilt travel, not an angle, and the end positions
-differ per blind. Polarity too, so `slat_pos: 0` may well be the open side. Measure
-once: drive `slat_pos` to 0, lay a phone with a spirit level app on a slat, note the
-angle, repeat at 100, enter both as `angAtPos0` and `angAtPos100`.
+Drive `slat_pos` to each end in the web interface, lay a phone with a spirit level app flat on a slat and read off the angle. Positive means the room-side edge points up, negative values are fine.
 
-Worth doing carefully. A calibration error shifts every position the same way, and no
-rounding absorbs it.
+Do not assume `slat_pos` 0 is the closed side. It is a percentage of the tilt travel, not an angle, and the polarity depends on the wiring.
 
 ## Configuration
 
-All settings live in the `CFG` block at the top of the script.
+All settings live in the `CFG` block at the top of the script. Only some are checked
+when it starts: the slat dimensions, the two calibration points, `stepDeg`, the
+tolerances and the coordinates. The rest are trusted, and an out of range value simply
+behaves oddly rather than failing loudly.
 
 ### Location and window
 
-<img src="docs/window-sector.svg" alt="Window orientation and direction tolerance, plan view" width="620">
+<img src="docs/window-sector.svg" alt="Window orientation and direction tolerance, plan view" width="580">
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `lat` / `lon` | — | Location in decimal degrees |
-| `azimuth` | `180` | Window facing direction, 0=N, 90=E, 180=S, 270=W |
-| `tolStart` / `tolEnd` | `85` | Direction tolerance as the sun enters and leaves |
-| `minElev` | `5` | Minimum solar elevation for shading |
-| `coverId` | `0` | Only relevant on devices with two covers |
+| Parameter | Meaning | Unit | Range | Default |
+|---|---|---|---|---|
+| `lat` | Latitude | ° | −90…90 | — |
+| `lon` | Longitude | ° | −180…180 | — |
+| `azimuth` | Window facing direction, 0=N, 90=E, 180=S, 270=W | ° | 0…360 | `180` |
+| `tolStart` / `tolEnd` | Direction tolerance as the sun enters and leaves | ° | 0…90 | `85` |
+| `minElev` | Minimum solar elevation for shading | ° | 0…90 | `5` |
+| `coverId` | Only relevant on devices with two covers | — | 0…1 | `0` |
 
 ### Slats and tracking
 
-<img src="docs/slat-geometry.svg" alt="Slat width, slat distance, profile angle and cut-off angle" width="620">
+<img src="docs/slat-geometry.svg" alt="Slat width, slat distance, profile angle and cut-off angle" width="420">
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `slats` | `true` | `false` for roller shutters without slats |
-| `slatWidth` / `slatDist` | `70` / `60` | Slat width `w` and distance `d` in mm |
-| `angAtPos0` / `angAtPos100` | `80` / `-10` | Measured end angles, see [calibration](#calibration) |
-| `stepDeg` | `15` | Angular step of the tracking |
-| `intervalMin` | `20` | Minimum pause between movements, start and end included |
-| `mode` | `1` | 0 = maximum daylight, 1 = maximum cooling |
-| `coolExtra` | `20` | Extra degrees towards closed in mode 1 |
-| `shadePos` | `0` | Curtain position while shading |
-| `endAction` | `1` | 0=nothing, 1=open, 2=close, 3=slats horizontal |
-| `endSkipDeg` | `8` | End action skipped this close to `dayNightElev`, keep above `minElev` |
+| Parameter | Meaning | Unit | Range | Default |
+|---|---|---|---|---|
+| `slats` | `false` for roller shutters without slats | — | true / false | `true` |
+| `slatWidth` / `slatDist` | Slat width `w` and distance `d` | mm | > 0 | `70` / `60` |
+| `angAtPos0` / `angAtPos100` | Measured end angles, see [calibration](#calibration) | ° | −90…90 | `80` / `-10` |
+| `stepDeg` | Angular step of the tracking | ° | > 0 | `15` |
+| `intervalMin` | Minimum pause between movements, start and end included | min | ≥ 0 | `20` |
+| `mode` | 0 = maximum daylight, 1 = maximum cooling | — | 0…1 | `1` |
+| `coolExtra` | Extra slat degrees towards closed in mode 1 | ° | ≥ 0 | `20` |
+| `shadePos` | Curtain position while shading | % | 0…100 | `0` |
+| `endAction` | 0=nothing, 1=open, 2=close, 3=slats horizontal | — | 0…3 | `1` |
+| `endSkipDeg` | End action skipped this close to `dayNightElev`, keep above `minElev` | ° | ≥ 0 | `8` |
 
 ### Day and night
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `dayTrigger` | `"cmd"` | `"sun"` = sunrise, `"cmd"` = wait for a wake call |
-| `dayFallbackHour` | `9` | Opens at this local hour if no wake call arrives |
-| `wakeAlwaysOpen` | `false` | `true` = always fully open on wake |
-| `sunsetAction` | `true` | Close at sunset |
-| `dayPos` / `daySlat` | `100` / `100` | Day position |
-| `nightPos` / `nightSlat` | `0` / `0` | Night position |
-| `dayNightElev` | `0` | Day/night switch. Negative closes later, `-4` ≈ civil twilight |
+| Parameter | Meaning | Unit | Range | Default |
+|---|---|---|---|---|
+| `dayTrigger` | `"sun"` = sunrise, `"cmd"` = wait for a wake call | — | sun / cmd | `"cmd"` |
+| `dayFallbackHour` | Opens at this local hour if no wake call arrives | h | 0…23 | `9` |
+| `wakeAlwaysOpen` | `true` = always fully open on wake | — | true / false | `false` |
+| `sunsetAction` | Close at sunset | — | true / false | `true` |
+| `dayPos` / `daySlat` | Day position | % | 0…100 | `100` / `100` |
+| `nightPos` / `nightSlat` | Night position | % | 0…100 | `0` / `0` |
+| `dayNightElev` | Day/night switch. Negative closes later, `-4` ≈ civil twilight | ° | −18…90 | `0` |
 
 ### Heat demand and system
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `demandMaxAgeH` | `24` | Age at which the heat demand counts as lost |
-| `fallbackMonths` | `[4..9]` | Months that shade without a valid demand |
-| `tickSec` | `300` | Cycle time |
-| `selfCmdSec` | `90` | Window in which a cover report still counts as our own command |
-| `debug` | `true` | Output to the script console |
+| Parameter | Meaning | Unit | Range | Default |
+|---|---|---|---|---|
+| `demandMaxAgeH` | Age at which the heat demand counts as lost | h | > 0 | `24` |
+| `fallbackMonths` | Months that shade without a valid demand | — | 1…12 | `[4..9]` |
+| `tickSec` | Cycle time | s | > 0 | `300` |
+| `selfCmdSec` | Window in which a cover report still counts as our own command | s | ≥ 0 | `90` |
+| `debug` | Output to the script console | — | true / false | `true` |
 
 ## HTTP endpoints
 
@@ -110,13 +112,14 @@ All settings live in the `CFG` block at the top of the script.
 | `/script/1/window?v=1` / `?v=0` | Window open / closed |
 | any of them without `?v=` | Read status only |
 
-Each one answers with the current state as JSON and triggers a cycle immediately, so
-there is no wait until the next tick.
+The `1` is a placeholder: it is the script's ID, the number the Shelly gives it in the
+script list. Use `1` if this is the only script on the device, otherwise your own number.
+
+Each one answers with the current state as JSON and triggers a cycle immediately, so there is no wait until the next tick.
 
 ## Smart home integration
 
-Examples are Apple Home; the principle holds anywhere. Join the Shelly over Matter and
-drive the endpoints from your automations.
+Examples are Apple Home; the principle holds anywhere. Join the Shelly over Matter and drive the endpoints from your automations.
 
 **Room temperature.** Two automations per room: above the upper threshold call
 `demand?v=1`, below the lower one `demand?v=0`. The hysteresis therefore lives in the
@@ -238,15 +241,6 @@ node test/run.js
 Covers the solar position against the theoretical solstice elevations, the day release,
 manual override and wake behaviour, the window guard, what survives a reboot, and the
 flash write budget.
-
-## Known limitations
-
-- No wind or frost protection. With a weather station, add a branch that takes
-  precedence over everything else.
-- No shading from neighbouring buildings or trees. Raising `minElev` is a crude
-  approximation.
-- Whether Matter passes the slat angle through depends on firmware and controller, and
-  should be verified on the actual setup.
 
 ## License
 
