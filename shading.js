@@ -8,6 +8,8 @@
 //   http://<shelly-ip>/script/1/demand?v=0   -> back to normal
 //   http://<shelly-ip>/script/1/demand       -> read status only
 //   http://<shelly-ip>/script/1/wake         -> release the day (alarm clock)
+//   http://<shelly-ip>/script/1/window?v=1   -> window open, no downward travel
+//   http://<shelly-ip>/script/1/window?v=0   -> window closed again
 //
 // Manual operation of the cover pauses the automation for the rest of the
 // local day. Both that flag and the day release are stored as day numbers,
@@ -301,7 +303,9 @@ let ST = {
   demandTs: 0,         // 0 = restored but not yet stamped, see tick()
   phase: null,         // true = day, false = night, null = not yet known
   openedDay: -1,       // day on which the day position was released
-  pendingDay: false    // day position still to be driven if no shading
+  pendingDay: false,   // day position still to be driven if no shading
+  window: null,        // true = open, false = closed, null = never reported
+  pendingNight: false  // night position held back because the window was open
 };
 
 let saved = "";        // content last written to flash
@@ -322,7 +326,7 @@ function rpcDone(res, err, msg) {
 }
 
 function saveState() {
-  let o = { md: ST.manualDay, d: ST.demand, od: ST.openedDay };
+  let o = { md: ST.manualDay, d: ST.demand, od: ST.openedDay, w: ST.window };
   let s = JSON.stringify(o);
   if (s === saved) return;           // unchanged -> no flash access
   saved = s;
@@ -353,6 +357,11 @@ function loadState() {
     // seasonal fallback for a whole demandMaxAgeH.
     if (v.d === true || v.d === false) ST.demand = v.d;
     else ST.demand = null;
+    // Same reasoning for the window contact, with one difference: a restored
+    // "open" needs no timestamp. It simply keeps blocking until the sensor
+    // reports the window closed, which is the safe direction to fail in.
+    if (v.w === true || v.w === false) ST.window = v.w;
+    else ST.window = null;
     // demandTs stays 0 on purpose. The clock is usually not in sync yet at
     // this point, so now() would return 0 and the value would immediately
     // count as expired. tick() stamps it once the clock is valid.
@@ -374,6 +383,21 @@ function shadingDemand(t) {
     if (CFG.fallbackMonths[i] === m) return true;
   }
   return false;
+}
+
+// ============================================================
+// Window contact
+//
+// The blind must not travel down while the window is open, the bottom rail
+// would run into a tilted casement or its handle. Upward movements stay
+// allowed, they cannot collide with anything.
+//
+// Never reported means not blocking. Whoever has no window contact must not
+// end up with a blind that refuses to move, the same reasoning as for a heat
+// demand that was never reported.
+// ============================================================
+function windowOpen() {
+  return ST.window === true;
 }
 
 // ============================================================
@@ -401,6 +425,12 @@ function resetTracking() {
 }
 
 function runEndAction(t, alt) {
+  // Of the three end actions only "open" travels upwards. Closing, and
+  // driving the slats horizontal at shadePos, would both send the blind down.
+  if (windowOpen() && CFG.endAction !== 1) {
+    log("tracking ended, end action skipped, window open");
+    return;
+  }
   // Right before the day/night switch the sunset action follows within
   // minutes. Opening fully here would mean two full travels for nothing.
   if (CFG.sunsetAction) {
@@ -486,13 +516,29 @@ function tick() {
     ST.phase = isDay;
     resetTracking();
     if (isDay) {
+      ST.pendingNight = false;       // a new day, the night position is moot
       log("sunrise");
     } else {
       log("sunset");
       ST.pendingDay = false;
-      if (CFG.sunsetAction) drive(CFG.nightPos, CFG.nightSlat);
+      if (CFG.sunsetAction) {
+        if (windowOpen()) {
+          ST.pendingNight = true;    // driven as soon as the window closes
+          log("night position held back, window open");
+        } else {
+          drive(CFG.nightPos, CFG.nightSlat);
+        }
+      }
       return;
     }
+  }
+
+  // A night position that was held back at sunset. Driven as soon as the
+  // window closes, rather than leaving the blind up until the next evening.
+  if (!isDay && ST.pendingNight && !windowOpen()) {
+    ST.pendingNight = false;
+    drive(CFG.nightPos, CFG.nightSlat);
+    return;
   }
 
   // Day release. Deliberately outside the transition block so that it also
@@ -514,8 +560,9 @@ function tick() {
   if (ar <= tol && ar < 90) inSector = true;
 
   let demand = shadingDemand(t);
+  let winOpen = windowOpen();
   let should = false;
-  if (!isManual(t) && isOpened(t) && demand && inSector && sun.alt >= CFG.minElev) should = true;
+  if (!isManual(t) && isOpened(t) && demand && inSector && sun.alt >= CFG.minElev && !winOpen) should = true;
 
   let m = "alt=" + num(Math.round(sun.alt));
   m = m + " az=" + num(Math.round(sun.az));
@@ -523,6 +570,7 @@ function tick() {
   m = m + " demand=" + num(demand);
   m = m + " sector=" + num(inSector);
   m = m + " manual=" + num(isManual(t));
+  m = m + " window=" + num(winOpen);
   log(m);
 
   // By default a pending day position is dropped when shading is already
@@ -656,7 +704,7 @@ HTTPServer.registerEndpoint("demand", function (req, res) {
     ST.demandTs = now();
     saveState();                            // writes only on an actual change
   }
-  let o = { demand: ST.demand, active: ST.active, manual: isManual(now()) };
+  let o = { demand: ST.demand, active: ST.active, manual: isManual(now()), window_open: windowOpen() };
   res.code = 200;
   res.body = JSON.stringify(o);
   res.send();
@@ -676,6 +724,24 @@ HTTPServer.registerEndpoint("wake", function (req, res) {
   res.body = JSON.stringify(o);
   res.send();
   if (fresh) tick();               // decide immediately, do not wait for the next tick
+});
+
+// Window contact: blocks every downward movement while the window is open.
+//   http://<shelly-ip>/script/1/window?v=1
+HTTPServer.registerEndpoint("window", function (req, res) {
+  let v = qval(req.query, "v");
+  let changed = false;
+  if (v !== null && !isNaN(v)) {
+    let nv = (v > 0.5);
+    if (nv !== ST.window) changed = true;   // only a real flip needs a cycle
+    ST.window = nv;
+    saveState();                            // writes only on an actual change
+  }
+  let o = { window_open: windowOpen(), pending_night: ST.pendingNight, active: ST.active };
+  res.code = 200;
+  res.body = JSON.stringify(o);
+  res.send();
+  if (changed) tick();
 });
 
 // ============================================================

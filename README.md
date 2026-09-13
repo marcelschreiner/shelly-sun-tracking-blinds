@@ -1,97 +1,174 @@
 # Shelly Sun Tracking Blinds
 
 Autonomous venetian blind control as a Shelly script. The device computes the solar
-position itself, derives the slat angle needed to block direct sunlight, and tracks it
-through the day. No server, no broker, no cloud. A network outage does not stop it.
+position itself, derives the slat angle that blocks direct sunlight, and tracks it
+through the day. No server, no broker, no cloud.
 
 Tested on Shelly Gen2 and newer in the Cover profile.
 
-## Features
+## What it uses
 
-- Solar elevation and azimuth from clock and coordinates, without any external service
-- Slat angle from slat width, slat distance and window orientation
-- Tracking in a configurable angular step, with a minimum pause between movements
-- Day and night positions, triggered either by sunrise or by an external wake call
-- Manual operation during the day pauses the automation for the rest of the local day
-- Heat demand supplied from outside as a plain yes/no over HTTP
-- Layered fallbacks for network, hub or time server failures
+| Input | Comes from | Effect |
+|---|---|---|
+| **Sun position** | computed on the device, from clock and coordinates | sets the slat angle |
+| **Room temperature** | your smart home, via `/demand` | whether to shade at all |
+| **Alarm clock** | your smart home, via `/wake` | releases the day, blind opens |
+| **Window contact** | your smart home, via `/window` | blocks any downward travel |
+| **Manual operation** | the button, app or web interface | pauses automation until midnight |
 
-## Architecture
+Only the sun position is required. Every other input is optional, has a fallback, and
+reaches the device as a plain yes/no over HTTP. The Shelly stays the only controller:
+**no schedule on your smart home platform may write to the same cover**, or the script
+cannot tell an automation from a manual command and locks itself out for the day.
 
-```mermaid
-graph LR
-    HK["Temperature<br/>sensor"] --> AH["Smart home<br/>automation"]
-    ALARM["Alarm clock<br/>automation"] --> AH
-    AH -->|"HTTP /demand /wake"| SH
-    SH["Shelly<br/>script + solar position"] --> M["Motor<br/>curtain + slats"]
-    SH -.->|"Matter"| AH
+## Quick start
 
-    style SH fill:#2d6a4f,color:#fff
+1. Enable the Cover profile and calibrate the blind
+2. Enable slat control and set the tilt time
+3. Under *Scripts*, create a new script and paste [`shading.js`](shading.js)
+4. Adjust `CFG`, at minimum coordinates, `azimuth` and the slat dimensions
+5. Run the [calibration](#calibration)
+6. Start the script and enable *Run on startup*
+
+The `1` in the endpoint URLs is the script ID on the device.
+
+## Calibration
+
+The one step that cannot be computed.
+
+<img src="docs/calibration.svg" alt="Slat angle at both mechanical end positions" width="620">
+
+`slat_pos` is a percentage of the tilt travel, not an angle, and the end positions
+differ per blind. Polarity too, so `slat_pos: 0` may well be the open side. Measure
+once: drive `slat_pos` to 0, lay a phone with a spirit level app on a slat, note the
+angle, repeat at 100, enter both as `angAtPos0` and `angAtPos100`.
+
+Worth doing carefully. A calibration error shifts every position the same way, and no
+rounding absorbs it.
+
+## Configuration
+
+All settings live in the `CFG` block at the top of the script.
+
+### Location and window
+
+<img src="docs/window-sector.svg" alt="Window orientation and direction tolerance, plan view" width="620">
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `lat` / `lon` | — | Location in decimal degrees |
+| `azimuth` | `180` | Window facing direction, 0=N, 90=E, 180=S, 270=W |
+| `tolStart` / `tolEnd` | `85` | Direction tolerance as the sun enters and leaves |
+| `minElev` | `5` | Minimum solar elevation for shading |
+| `coverId` | `0` | Only relevant on devices with two covers |
+
+### Slats and tracking
+
+<img src="docs/slat-geometry.svg" alt="Slat width, slat distance, profile angle and cut-off angle" width="620">
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `slats` | `true` | `false` for roller shutters without slats |
+| `slatWidth` / `slatDist` | `70` / `60` | Slat width `w` and distance `d` in mm |
+| `angAtPos0` / `angAtPos100` | `80` / `-10` | Measured end angles, see [calibration](#calibration) |
+| `stepDeg` | `15` | Angular step of the tracking |
+| `intervalMin` | `20` | Minimum pause between movements, start and end included |
+| `mode` | `1` | 0 = maximum daylight, 1 = maximum cooling |
+| `coolExtra` | `20` | Extra degrees towards closed in mode 1 |
+| `shadePos` | `0` | Curtain position while shading |
+| `endAction` | `1` | 0=nothing, 1=open, 2=close, 3=slats horizontal |
+| `endSkipDeg` | `8` | End action skipped this close to `dayNightElev`, keep above `minElev` |
+
+### Day and night
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `dayTrigger` | `"cmd"` | `"sun"` = sunrise, `"cmd"` = wait for a wake call |
+| `dayFallbackHour` | `9` | Opens at this local hour if no wake call arrives |
+| `wakeAlwaysOpen` | `false` | `true` = always fully open on wake |
+| `sunsetAction` | `true` | Close at sunset |
+| `dayPos` / `daySlat` | `100` / `100` | Day position |
+| `nightPos` / `nightSlat` | `0` / `0` | Night position |
+| `dayNightElev` | `0` | Day/night switch. Negative closes later, `-4` ≈ civil twilight |
+
+### Heat demand and system
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `demandMaxAgeH` | `24` | Age at which the heat demand counts as lost |
+| `fallbackMonths` | `[4..9]` | Months that shade without a valid demand |
+| `tickSec` | `300` | Cycle time |
+| `selfCmdSec` | `90` | Window in which a cover report still counts as our own command |
+| `debug` | `true` | Output to the script console |
+
+## HTTP endpoints
+
+| Call | Effect |
+|---|---|
+| `/script/1/demand?v=1` / `?v=0` | Too warm / back to normal |
+| `/script/1/wake` | Release the day |
+| `/script/1/window?v=1` / `?v=0` | Window open / closed |
+| any of them without `?v=` | Read status only |
+
+Each one answers with the current state as JSON and triggers a cycle immediately, so
+there is no wait until the next tick.
+
+## Smart home integration
+
+Examples are Apple Home; the principle holds anywhere. Join the Shelly over Matter and
+drive the endpoints from your automations.
+
+**Room temperature.** Two automations per room: above the upper threshold call
+`demand?v=1`, below the lower one `demand?v=0`. The hysteresis therefore lives in the
+app and can differ per room. In Apple Home use *Convert to Shortcut* and *Get Contents
+of URL*, which runs on the home hub without a phone.
+
+**Window contact.** One automation per window, opened and closed. Any sensor the
+platform can read will do. Shelly BLU sensors need a bridge such as Matterbridge or
+Homebridge, they cannot join Apple Home directly.
+
+**Alarm clock.** A personal shortcut automation on *When my alarm is stopped*, calling
+`/wake`, with *Ask Before Running* off. This one runs on the phone; a fixed-time home
+automation works too but loses the link to the actual alarm.
+
+## How it works
+
+**Solar position.** NOAA approximation from the device unix time, below 0.01 degrees of
+error, verified against the theoretical solstice elevations.
+
+**Slat angle.** The profile angle `p` is the sun's apparent angle in the window plane,
+from `h` (elevation) and `γ` (azimuth minus window orientation). The cut-off angle `β`
+is the flattest slat angle that still shades, see the
+[diagram](#slats-and-tracking) above:
+
+```
+p = atan( tan(h) / cos(γ) )      sin(β + p) = (d / w) · cos(p)
 ```
 
-The Shelly is the only controller. The smart home platform feeds two signals into it
-and serves as a remote control. If the dashed link fails, shading keeps running.
+If `d > w` the blind never closes tightly and the script clamps to the steepest value
+it can reach.
 
-## How the angle is derived
+**Rounding.** Always towards closed, in steps of `stepDeg`. Rounding to the nearest
+step would let a stripe of sun through on every second step; rounding one way also
+leaves half a step of margin for the mechanical play of the blind.
 
-**Solar position.** NOAA approximation from the device unix time. The error stays below
-0.01 degrees, verified against the theoretical solar elevations at the solstices.
+**When it shades.** Only when all of it holds: no manual override, day released, heat
+demand active, window closed, sun inside the sector and above `minElev`.
 
-**Profile angle.** The apparent angle of incidence in the window plane, that is, the
-angle the sun has from the slat's point of view:
+### Window guard
 
-```
-p = atan( tan(h) / cos(γ) )
-```
+A blind travelling down into a tilted casement runs its bottom rail into the frame or
+the handle. While the window is open, no command that lowers the blind is issued:
 
-where `h` is the solar elevation and `γ` the angle between solar azimuth and window
-orientation.
+- shading does not start, and a running tracking ends
+- the sunset position is held back, then driven as soon as the window closes
+- of the end actions only `endAction: 1` still runs, because it travels up
 
-**Cut-off angle.** The flattest slat angle at which the slats still shade each other
-for that profile angle:
+Upward movements stay allowed. A contact that was never reported blocks nothing, so a
+setup without one behaves as before. If you set `dayPos` to something other than fully
+up, that movement is not gated.
 
-```
-sin(β + p) = (d / w) · cos(p)
-```
-
-`w` is the slat width, `d` the distance between two slats. If `d > w` the blind never
-closes tightly, and the script clamps to the steepest achievable value.
-
-**Rounding.** The result is rounded to `stepDeg`, always towards closed. Rounding to
-the nearest step would let a stripe of sun through on every second step. Rounding one
-way also creates half a step of safety margin on average, which absorbs the mechanical
-play of the blind.
-
-## Cycle
-
-```mermaid
-flowchart TD
-    A["Tick every tickSec"] --> B{"Clock valid?"}
-    B -->|no| Z["do nothing"]
-    B -->|yes| C["Compute solar position"]
-    C --> D{"Day/night<br/>changed?"}
-    D -->|"→ night"| N["Drive night position<br/>clear day release"]
-    D -->|"→ day"| E["Release day<br/>per dayTrigger"]
-    D -->|no| F
-    E --> F{"Shade?"}
-    F -->|"no"| G{"Day position<br/>pending?"}
-    G -->|yes| H["Drive day position"]
-    G -->|no| I{"Was active?"}
-    I -->|yes| J["End action"]
-    I -->|no| Z
-    F -->|yes| K["Compute angle<br/>and round"]
-    K --> L{"Start, or<br/>pause elapsed<br/>and angle changed?"}
-    L -->|yes| M["Drive curtain and slats<br/>in a single call"]
-    L -->|no| Z
-
-    style M fill:#2d6a4f,color:#fff
-    style N fill:#1d3557,color:#fff
-```
-
-Shading runs only when all conditions hold: no manual override, day released, heat
-demand active, sun inside the window sector and above `minElev`.
-
-## Day cycle
+### Day cycle
 
 ```mermaid
 stateDiagram-v2
@@ -108,162 +185,59 @@ stateDiagram-v2
     Night --> Night: local midnight<br/>clears both flags
 ```
 
-`Day_locked` exists only with `dayTrigger: "cmd"`. In that state the blind stays down
-and shading does not engage either, so the morning sun cannot wake anyone. With
-`dayTrigger: "sun"` the state is skipped immediately, including when the script starts
-up in the middle of a day.
+`Day_locked` exists only with `dayTrigger: "cmd"`. The blind stays down and shading
+stays off, so the morning sun cannot wake anyone. With `"sun"` the state is skipped.
 
-Both the manual override and the day release are stored as local day numbers rather
-than as booleans. They therefore expire at local midnight on their own and survive a
-reboot without going stale. A side effect worth knowing: a wake call after sunset is
-ignored, because the day was already released that morning, while a wake call before
-sunrise still works, which is what a winter alarm needs.
+Manual override and day release are stored as local day numbers, not booleans, so they
+expire at midnight on their own and survive a reboot without going stale. Three
+consequences:
 
-Because the override expires at midnight and not at sunrise, a manual command in the
-dark would block the entire coming day, day position included. Manual operation below
-`dayNightElev` therefore does not pause the automation at all. Whoever adjusts the
-blind at three in the morning gets the normal day back a few hours later.
-
-If the wake call arrives while shading is already due, the day position is skipped and
-the blind goes straight to the shading position. Otherwise it would travel up and back
-down seconds later.
-
-## Installation
-
-1. Enable the Cover profile and calibrate the blind
-2. Enable slat control and set the tilt time
-3. Under *Scripts*, create a new script and paste `shading.js`
-4. Adjust the `CFG` block, at minimum coordinates, `azimuth` and the slat dimensions
-5. Run the calibration below
-6. Start the script and enable *Run on startup*
-
-The script number in the endpoint URLs matches the script ID on the device, so `1` for
-the first script.
-
-## Calibration
-
-The one step that cannot be computed, and the one worth doing carefully.
-
-`slat_pos` is not an angle. It is the percentage of tilt travel between the two
-mechanical end positions, and which angles those are depends on the blind. A venetian
-blind typically closes at 75 to 85 degrees because the slats overlap before reaching
-90, and opens only slightly past horizontal on many systems. Polarity depends on the
-wiring too, so `slat_pos: 0` may well be the open side.
-
-Procedure:
-
-1. Drive `slat_pos` to 0 in the web interface
-2. Place a phone with a spirit level app flat on a slat, note the angle
-3. Repeat at `slat_pos` 100
-4. Enter the values as `angAtPos0` and `angAtPos100`
-
-Positive means the room-side edge points up. Negative values are fine, the conversion
-flips along with them.
-
-A calibration error is systematic and shifts every position in the same direction. No
-rounding absorbs it, unlike the mechanical scatter of the blind itself.
-
-## Configuration
-
-| Parameter | Default | Meaning |
-|---|---|---|
-| `coverId` | `0` | Only relevant on devices with two covers |
-| `lat` / `lon` | — | Location in decimal degrees |
-| `azimuth` | `180` | Window facing direction, 0=N, 90=E, 180=S, 270=W |
-| `tolStart` / `tolEnd` | `85` | Direction tolerance as the sun enters and leaves |
-| `minElev` | `5` | Minimum solar elevation for shading |
-| `slats` | `true` | `false` for roller shutters without slats |
-| `slatWidth` / `slatDist` | `70` / `60` | Slat width and distance in mm |
-| `angAtPos0` / `angAtPos100` | `80` / `-10` | Measured end position angles, see calibration |
-| `stepDeg` | `15` | Angular step of the tracking |
-| `intervalMin` | `20` | Minimum pause between two movements, start and end included |
-| `selfCmdSec` | `90` | Window in which a cover report still counts as our own command |
-| `mode` | `1` | 0 = maximum daylight, 1 = maximum cooling |
-| `coolExtra` | `20` | Extra degrees towards closed in mode 1 |
-| `shadePos` | `0` | Curtain position while shading |
-| `endAction` | `1` | 0=nothing, 1=open, 2=close, 3=slats horizontal |
-| `endSkipDeg` | `8` | End action is skipped this close to `dayNightElev`, keep above `minElev` |
-| `dayTrigger` | `"cmd"` | `"sun"` = sunrise, `"cmd"` = wait for a wake call |
-| `dayFallbackHour` | `9` | Local hour at which the blind opens without a wake call |
-| `wakeAlwaysOpen` | `false` | `true` = always fully open on wake |
-| `sunsetAction` | `true` | Close at sunset |
-| `dayPos` / `daySlat` | `100` / `100` | Day position |
-| `nightPos` / `nightSlat` | `0` / `0` | Night position |
-| `dayNightElev` | `0` | Solar elevation for the day/night switch |
-| `demandMaxAgeH` | `24` | Age at which the heat demand counts as lost |
-| `fallbackMonths` | `[4..9]` | Months that shade without a valid demand |
-| `tickSec` | `300` | Cycle time |
-| `debug` | `true` | Output to the script console |
-
-`dayNightElev` may be negative. Around `-4` roughly matches civil twilight, which makes
-the blind close later in the evening.
-
-## HTTP endpoints
-
-| Call | Effect |
-|---|---|
-| `/script/1/demand?v=1` | Too warm, release shading |
-| `/script/1/demand?v=0` | Temperature back to normal |
-| `/script/1/demand` | Read status only |
-| `/script/1/wake` | Release the day |
-
-Every endpoint answers with the current state as JSON, which is convenient for checking
-in a browser. A change triggers a cycle immediately, so there is no delay until the
-next tick.
-
-## Smart home integration
-
-The examples below use Apple Home, but the principle applies to any platform: the
-Shelly is joined over Matter, and **no schedule on the platform may write to the same
-cover**. Two controllers on one device mean the script cannot tell an automation apart
-from a manual command, and it would lock itself out for the rest of the day.
-
-**Heat demand.** Two automations per room, triggered by the temperature sensor. Above
-the upper threshold call `demand?v=1`, below the lower one call `demand?v=0`. The
-hysteresis therefore lives in the smart home app and can differ per room. In Apple
-Home, extend the automation via *Convert to Shortcut* and use *Get Contents of URL*
-there. This runs on the home hub, no phone required.
-
-**Wake call.** A personal shortcut automation triggered by *When my alarm is stopped*,
-calling `/wake`. This one runs on the phone. Turn off *Ask Before Running*. For a
-device-independent setup, use a fixed-time home automation instead and give up the link
-to the actual alarm.
+- A wake call after sunset does nothing, the day was already released that morning. One
+  before sunrise still works, which is what a winter alarm needs.
+- Manual operation below `dayNightElev` does not pause anything. Otherwise adjusting
+  the blind at three in the morning would block the whole coming day.
+- A wake call while shading is already due skips the day position, instead of
+  travelling up and back down seconds later.
 
 ## Autonomy
 
-The design goal is that a single device keeps working when everything else fails.
+A single device keeps working when everything else fails.
 
 | Failure | Behaviour |
 |---|---|
 | Network, hub or phone gone | Shading continues, only without a current heat demand |
 | Heat demand older than `demandMaxAgeH` | Falls back to `fallbackMonths`, the season decides |
 | No wake call arrives | Opens at `dayFallbackHour` at the latest |
-| Power loss | Manual override, heat demand and day release are restored from KVS |
-| Clock synchronises late after boot | The restored heat demand is stamped on the first valid tick, not on restore |
+| Power loss | Override, heat demand, day release and window state restored from KVS |
+| Clock synchronises late after boot | Restored heat demand is stamped on the first valid tick |
 | No valid clock after boot | Tracking pauses instead of driving to a wrong position |
-
-## Flash wear
-
-The ESP32 flash tolerates roughly 100,000 write cycles per sector. Only three values are
-persisted, namely the ones that cannot be derived again: manual override day, heat
-demand and day release. `saveState()` compares against the last written content and writes only
-on an actual change. That amounts to a handful of writes per day instead of several
-hundred.
-
-Everything else lives in RAM and is back after one cycle at most.
+| Window contact stops reporting while open | Blind stays up. No season to fall back on, so it errs towards not moving; `window?v=0` clears it |
 
 ## Notes on the code
 
-mJS is not full JavaScript. Two quirks shape the style:
+**Flash wear.** The ESP32 tolerates roughly 100,000 writes per sector. Only what cannot
+be derived again is persisted: override day, heat demand, day release, window state.
+`saveState()` compares against the last written content, which turns several hundred
+writes a day into a handful. Everything else lives in RAM.
 
-**Missing math.** Only `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`, `pow`,
-`exp`, `log` and `random` are available. `atan2`, `atan`, `asin`, `tan`, `sqrt` and `PI`
-are implemented in the script itself. `atan2` uses a minimax polynomial with a maximum
-error of 0.0001 degrees.
+**mJS is not full JavaScript.** Only `sin`, `cos`, `floor`, `ceil`, `round`, `min`,
+`max`, `pow`, `exp`, `log` and `random` exist, so `atan2`, `atan`, `asin`, `tan`, `sqrt`
+and `PI` are implemented in the script. And the stack is small: nested expressions
+overflow it, which is why everything is deliberately flat and uses intermediate
+variables. It looks clumsy, and it is the reason the script runs at all.
 
-**Small stack.** Expressions are evaluated recursively and deeply nested terms overflow
-it. Everything is therefore deliberately flat, using intermediate variables instead of
-compact one-liners. It looks clumsy, and it is the reason the script runs at all.
+## Tests
+
+`shading.js` runs unmodified under node, against a stub of the Shelly runtime and a
+virtual clock.
+
+```bash
+node test/run.js
+```
+
+Covers the solar position against the theoretical solstice elevations, the day release,
+manual override and wake behaviour, the window guard, what survives a reboot, and the
+flash write budget.
 
 ## Known limitations
 
@@ -271,25 +245,9 @@ compact one-liners. It looks clumsy, and it is the reason the script runs at all
   precedence over everything else.
 - No shading from neighbouring buildings or trees. Raising `minElev` is a crude
   approximation.
-- Whether Matter passes the slat angle through to a given controller depends on
-  firmware and controller, and should be verified on the actual setup.
-- Shelly BLU sensors cannot be added to Apple Home directly. That needs a bridge such
-  as Matterbridge or Homebridge.
-
-## Tests
-
-`shading.js` runs unmodified under node against a stub of the Shelly runtime, with a
-virtual clock. The suite covers the solar position against the theoretical solstice
-elevations, the day release, override and wake behaviour, the movement pacing and the
-flash write budget.
-
-```
-node test/run.js
-```
-
-Every case under day release, manual override and wake call corresponds to a bug that
-was found and fixed, so the same mistake cannot come back unnoticed.
+- Whether Matter passes the slat angle through depends on firmware and controller, and
+  should be verified on the actual setup.
 
 ## License
 
-MIT.
+MIT, see [LICENSE](LICENSE).

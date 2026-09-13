@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 360" width="620" height="360" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 z" fill="#78838f"/>
+    </marker>
+    <marker id="arS" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L8,3 L0,6 z" fill="#d9a441"/>
+    </marker>
+  </defs>
+
+  <!-- outside / room -->
+  <text x="24" y="300" font-size="14" fill="#78838f">outside</text>
+  <text x="520" y="300" font-size="14" fill="#78838f">room</text>
+
+  <!-- sun ray, grazes the outer edge of the upper slat and lands on the room edge of the lower slat -->
+  <line x1="85" y1="123.7" x2="332.9" y2="214.2" stroke="#d9a441" stroke-width="2.5" marker-end="url(#arS)"/>
+  <circle cx="70" cy="118.2" r="11" fill="none" stroke="#d9a441" stroke-width="2"/>
+  <line x1="70" y1="101" x2="70" y2="107" stroke="#d9a441" stroke-width="2"/>
+  <line x1="70" y1="129.4" x2="70" y2="135.4" stroke="#d9a441" stroke-width="2"/>
+  <line x1="53" y1="118.2" x2="59" y2="118.2" stroke="#d9a441" stroke-width="2"/>
+  <line x1="81" y1="118.2" x2="87" y2="118.2" stroke="#d9a441" stroke-width="2"/>
+
+  <!-- profile angle p -->
+  <line x1="85" y1="123.7" x2="175" y2="123.7" stroke="#78838f" stroke-width="1" stroke-dasharray="4 4"/>
+  <path d="M 145 123.7 A 60 60 0 0 1 141.3 144.3" fill="none" stroke="#d9a441" stroke-width="1.6"/>
+  <text x="152" y="142" font-size="16" fill="#d9a441" font-style="italic">p</text>
+
+  <!-- upper slat -->
+  <line x1="207.1" y1="168.3" x2="332.9" y2="86.7" stroke="#3d9970" stroke-width="9" stroke-linecap="round"/>
+  <!-- lower slat -->
+  <line x1="207.1" y1="295.8" x2="332.9" y2="214.2" stroke="#3d9970" stroke-width="9" stroke-linecap="round"/>
+
+  <!-- slat width w, along the upper slat -->
+  <line x1="197.6" y1="153.7" x2="323.4" y2="72.1" stroke="#78838f" stroke-width="1" marker-end="url(#ar)"/>
+  <line x1="323.4" y1="72.1" x2="197.6" y2="153.7" stroke="#78838f" stroke-width="1" marker-end="url(#ar)"/>
+  <text x="248" y="104" font-size="16" fill="#78838f" font-style="italic">w</text>
+
+  <!-- slat distance d, vertical between the two outer edges -->
+  <line x1="207.1" y1="168.3" x2="186" y2="168.3" stroke="#78838f" stroke-width="1" stroke-dasharray="4 4"/>
+  <line x1="207.1" y1="295.8" x2="186" y2="295.8" stroke="#78838f" stroke-width="1" stroke-dasharray="4 4"/>
+  <line x1="192" y1="168.3" x2="192" y2="295.8" stroke="#78838f" stroke-width="1" marker-end="url(#ar)"/>
+  <line x1="192" y1="295.8" x2="192" y2="168.3" stroke="#78838f" stroke-width="1" marker-end="url(#ar)"/>
+  <text x="168" y="238" font-size="16" fill="#78838f" font-style="italic">d</text>
+
+  <!-- slat angle beta at the lower slat -->
+  <line x1="270" y1="255" x2="372" y2="255" stroke="#78838f" stroke-width="1" stroke-dasharray="4 4"/>
+  <path d="M 325 255 A 55 55 0 0 0 316.1 225.0" fill="none" stroke="#4b8bbe" stroke-width="1.6"/>
+  <text x="330" y="243" font-size="16" fill="#4b8bbe" font-style="italic">β</text>
+
+  <!-- captions -->
+  <text x="360" y="300" font-size="13" fill="#78838f">horizontal</text>
+  <text x="24" y="34" font-size="14" fill="#78838f">Cut-off: the flattest β at which the ray</text>
+  <text x="24" y="54" font-size="14" fill="#78838f">no longer passes between two slats</text>
+  <text x="360" y="34" font-size="15" fill="#78838f" font-style="italic">sin(β + p) = (d / w) · cos(p)</text>
+</svg>
