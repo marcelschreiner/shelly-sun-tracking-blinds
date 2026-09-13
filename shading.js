@@ -17,6 +17,10 @@
 // Both that flag and the day release are stored as day numbers, so they
 // expire at local midnight and survive a reboot without going stale.
 //
+// Every entry point (tick, status handler, endpoints) runs under try/catch.
+// An uncaught error ends the script, and an ended script shades nothing
+// until someone notices. One bad value costs one cycle, not the summer.
+//
 // NOTE on code style: mJS has a very small stack and evaluates
 // expressions recursively. Deeply nested terms and long concatenations
 // overflow it. Everything here is therefore deliberately flat, using
@@ -49,10 +53,12 @@ let CFG = {
   stepDeg: 15,           // tracking granularity
   intervalMin: 20,       // minimum pause between two movements, also between
                          // start, end and restart of the tracking
-  selfCmdSec: 90,        // a cover report within this window after our own
-                         // command is ours, not the user. Must cover the full
-                         // travel time of the blind, the report only arrives
-                         // once the motor has stopped.
+  selfCmdSec: 90,        // the longest a movement of ours can take, from the
+                         // command to the report that the motor has stopped.
+                         // Reports of our own source later than this are not
+                         // ours. Until the script has learned its own source
+                         // (see the status handler) any report it cannot place
+                         // inside this window counts as ours as well.
 
   mode: 1,               // 0 = maximum daylight, 1 = maximum cooling
   coolExtra: 20,         // extra degrees towards closed in mode 1
@@ -303,12 +309,20 @@ let T_VALID = 1700000000;   // below this the device clock is not in sync yet
 
 let ST = {
   manualDay: -1,       // day on which manual operation was detected
-  active: false,       // tracking is currently running
+  manualTs: 0,         // when it was detected, RAM only, see the retry block
+  manualUp: -1,        // uptime of a manual report seen before the clock was
+                       // valid, -1 = none, dated on the first valid tick
+  wakePending: false,  // wake call received before the clock was valid
+  ownSrc: null,        // how the cover names our commands, learned from the
+                       // first report after one, persisted. See the handler.
+  active: false,       // tracking is currently running, persisted
   lastAng: 999,
   lastSlat: -1,        // slat_pos last commanded by the tracking, -1 = none
   lastPos: -1,         // cover position last commanded by the tracking
   lastMove: 0,
   selfCmd: 0,          // timestamp of our own last movement command
+  cmdSeq: 0,           // counts our commands, a late refusal of an older
+                       // one must not become a retry
   demand: null,        // true = too warm, false = fine, null = never reported
   demandTs: 0,         // 0 = restored but not yet stamped, see tick()
   phase: null,         // true = day, false = night, null = not yet known
@@ -328,7 +342,33 @@ function now() {
   return 0;
 }
 
-// Every RPC gets this callback. Without one a failed call is invisible, and
+// Seconds since boot. Counts from the first second, clock or no clock.
+function uptime() {
+  let s = Shelly.getComponentStatus("sys");
+  if (s && typeof s.uptime === "number") return s.uptime;
+  return 0;
+}
+
+// ============================================================
+// Error guard
+//
+// An uncaught error ends the script, in a callback as much as anywhere else,
+// and an ended script shades nothing until someone notices and restarts it
+// by hand. Every entry point therefore runs under try/catch. Errors are
+// printed whatever the debug flag says.
+// ============================================================
+function errText(e) {
+  if (typeof e === "string") return e;
+  if (e && typeof e.message === "string") return e.message;
+  return num(e);
+}
+
+function guard(f, a, b) {
+  try { f(a, b); }
+  catch (e) { print("[shade] ERROR: " + errText(e)); }
+}
+
+// Every RPC gets a callback. Without one a failed call is invisible, and
 // the script would keep believing the blind followed its command.
 function rpcDone(res, err, msg) {
   if (err === 0) return;
@@ -337,45 +377,68 @@ function rpcDone(res, err, msg) {
   log(m);
 }
 
+// A failed flash write must not pass for a successful one, or the same
+// state would never be written again.
+function kvsDone(res, err, msg) {
+  if (err === 0) return;
+  saved = "";
+  rpcDone(res, err, msg);
+}
+
 function saveState() {
-  let o = { md: ST.manualDay, d: ST.demand, od: ST.openedDay, w: ST.window };
+  let o = { md: ST.manualDay, d: ST.demand, od: ST.openedDay, w: ST.window, a: ST.active, s: ST.ownSrc };
   let s = JSON.stringify(o);
   if (s === saved) return;           // unchanged -> no flash access
   saved = s;
-  Shelly.call("KVS.Set", { key: "shade_state", value: s }, rpcDone);
+  Shelly.call("KVS.Set", { key: "shade_state", value: s }, kvsDone);
   log("saved: " + s);
 }
 
-// Anything coming out of flash is treated as foreign input. mJS has no
-// exceptions, so a value from an older version or a half written record must
-// not reach JSON.parse unchecked, otherwise the script dies at startup and
-// nothing shades at all until someone restarts it by hand.
+// Anything coming out of flash is treated as foreign input. A record from an
+// older version or a half written one must not kill the script at startup,
+// otherwise nothing shades at all until someone restarts it by hand. The
+// shape is checked first, and JSON.parse runs under try/catch on top.
+function parseState(s) {
+  if (typeof s !== "string") { log("stored state not a string, ignored"); return null; }
+  let head = s.slice(0, 1);
+  let tail = s.slice(s.length - 1);
+  if (head !== "{" || tail !== "}") { log("stored state malformed, ignored"); return null; }
+  let v = null;
+  try { v = JSON.parse(s); } catch (e) { v = null; }
+  if (!v) { log("stored state unreadable, ignored"); return null; }
+  return v;
+}
+
+function onStateLoaded(res, err) {
+  if (err !== 0) { log("no stored state"); return; }
+  if (!res) return;
+  let v = parseState(res.value);
+  if (v === null) return;
+  saved = res.value;
+  if (typeof v.md === "number") ST.manualDay = v.md;
+  if (typeof v.od === "number") ST.openedDay = v.od;
+  // Only a real boolean counts. Anything else stays null, otherwise
+  // shadingDemand() would treat an undefined as a fresh report and skip the
+  // seasonal fallback for a whole demandMaxAgeH.
+  if (v.d === true || v.d === false) ST.demand = v.d;
+  else ST.demand = null;
+  if (v.w === true || v.w === false) ST.window = v.w;
+  else ST.window = null;
+  // A tracking that was running when the power went, or the script was
+  // restarted, is resumed or ended properly on the first tick. Without this
+  // the blind would sit in its shading position until sunset.
+  if (v.a === true) ST.active = true;
+  if (typeof v.s === "string") ST.ownSrc = v.s;
+  // demandTs stays 0 on purpose. The clock is usually not in sync yet at
+  // this point, so now() would return 0 and the value would immediately
+  // count as expired. tick() stamps it once the clock is valid.
+  log("state restored: " + res.value);
+}
+
+function stateLoaded(res, err) { guard(onStateLoaded, res, err); }
+
 function loadState() {
-  Shelly.call("KVS.Get", { key: "shade_state" }, function (res, err) {
-    if (err !== 0) { log("no stored state"); return; }
-    if (!res) return;
-    let s = res.value;
-    if (typeof s !== "string") { log("stored state not a string, ignored"); return; }
-    let head = s.slice(0, 1);
-    let tail = s.slice(s.length - 1);
-    if (head !== "{" || tail !== "}") { log("stored state malformed, ignored"); return; }
-    let v = JSON.parse(s);
-    if (!v) { log("stored state unreadable, ignored"); return; }
-    saved = s;
-    if (typeof v.md === "number") ST.manualDay = v.md;
-    if (typeof v.od === "number") ST.openedDay = v.od;
-    // Only a real boolean counts. Anything else stays null, otherwise
-    // shadingDemand() would treat an undefined as a fresh report and skip the
-    // seasonal fallback for a whole demandMaxAgeH.
-    if (v.d === true || v.d === false) ST.demand = v.d;
-    else ST.demand = null;
-    if (v.w === true || v.w === false) ST.window = v.w;
-    else ST.window = null;
-    // demandTs stays 0 on purpose. The clock is usually not in sync yet at
-    // this point, so now() would return 0 and the value would immediately
-    // count as expired. tick() stamps it once the clock is valid.
-    log("state restored: " + s);
-  });
+  Shelly.call("KVS.Get", { key: "shade_state" }, stateLoaded);
 }
 
 // ============================================================
@@ -422,27 +485,38 @@ function windowOpen(t) {
 // ============================================================
 let RETRY_MAX = 3;     // repeats of a refused command before it is dropped
 
-function sendCmd(m, p) {
-  ST.selfCmd = now();
+// track = true marks a tracking step. Its retry is dropped once the tracking
+// itself has been dropped, the angle would be stale by then. The retry also
+// remembers when the command was issued, so a manual operation in between
+// wins over it, see tick().
+function sendCmd(m, p, track) {
+  let t = now();
+  ST.selfCmd = t;
+  ST.cmdSeq = ST.cmdSeq + 1;
+  let seq = ST.cmdSeq;
   Shelly.call(m, p, function (res, err, msg) {
-    if (err === 0) { ST.retryN = 0; return; }
+    if (err === 0) { ST.retryN = 0; ST.retry = null; return; }
     rpcDone(res, err, msg);
+    // A newer command went out before this refusal came back. The newer
+    // target is the one that counts, repeating the older one would drive
+    // the blind backwards.
+    if (seq !== ST.cmdSeq) { log("refusal of a superseded command, ignored"); return; }
     ST.retryN = ST.retryN + 1;
     if (ST.retryN > RETRY_MAX) {
       ST.retryN = 0;
       log("command dropped after " + num(RETRY_MAX) + " repeats");
       return;
     }
-    ST.retry = { m: m, p: p };
+    ST.retry = { m: m, p: p, t: t, track: (track === true) };
   });
 }
 
-function drive(pos, slatPos) {
+function drive(pos, slatPos, track) {
   let p = { id: CFG.coverId, pos: pos };
   if (CFG.slats && slatPos !== null) p.slat_pos = slatPos;
   // Position and slats must be sent in ONE call, otherwise the second
   // command overrides the first.
-  sendCmd("Cover.GoToPosition", p);
+  sendCmd("Cover.GoToPosition", p, track);
   let m = "drive pos=" + num(pos);
   m = m + " slat=" + num(slatPos);
   log(m);
@@ -450,11 +524,13 @@ function drive(pos, slatPos) {
 
 // Everything the tracking remembers about its last movement. Called wherever
 // the tracking is dropped, so no stale value can suppress the next command.
+// The active flag is persisted, so the change goes to flash right here.
 function resetTracking() {
   ST.active = false;
   ST.lastAng = 999;
   ST.lastSlat = -1;
   ST.lastPos = -1;
+  saveState();
 }
 
 function runEndAction(t, alt) {
@@ -517,6 +593,86 @@ function openDay(t, why) {
   saveState();
 }
 
+// Dark and past noon: the sun is on its way down, not up. A wake call now
+// would open the blind for the night. Normally isOpened() catches it, the
+// day was released that morning. This is the safety net for an empty store,
+// the first evening after installation.
+function isEvening(t) {
+  if (localHour(t) < 12) return false;
+  let sun = sunPos(t, CFG.lat, CFG.lon);
+  if (sun.alt >= CFG.dayNightElev) return false;
+  return true;
+}
+
+// ============================================================
+// Manual operation
+//
+// Everything after the filters of the status handler. Also used for a report
+// that arrived before the clock was valid, with its back-dated time.
+// ============================================================
+function markManual(t, src) {
+  if (isManual(t)) return;
+  // A manual command in the dark must not consume the coming day. The flag
+  // expires at local midnight, so anything touched between midnight and
+  // sunrise would otherwise block the whole day, day position included.
+  //
+  // Only while the day is still locked, though. After a wake call before
+  // sunrise the blind has already moved on its own, and whoever corrects it
+  // in the dark means it. Between sunset and midnight the day is released as
+  // well, so the flag is set there too, where it changes nothing: it expires
+  // at midnight and the night is over before the automation acts again.
+  let sun = sunPos(t, CFG.lat, CFG.lon);
+  if (sun.alt < CFG.dayNightElev && !isOpened(t)) {
+    log("manual operation (" + src + ") before the day release, automation not paused");
+    return;
+  }
+  ST.manualDay = localDay(t);
+  ST.manualTs = t;
+  // A day position still waiting to be driven would run over the manual
+  // command on the next tick. The person has chosen a position, and that is
+  // the day position now.
+  ST.pendingDay = false;
+  resetTracking();
+  log("manual operation (" + src + ") -> tracking paused until midnight");
+  saveState();
+}
+
+// Cover reports name their source. Ours is "script:<id>". Another script on
+// the same device is a second controller and counts as manual, but only when
+// the own id is known. Without it every script has to count as us, or the
+// automation would pause itself after each of its own movements.
+let OWN_ID = -1;
+if (Shelly.getCurrentScriptId) {
+  let sid = Shelly.getCurrentScriptId();
+  if (typeof sid === "number") OWN_ID = sid;
+}
+
+function isOwnSource(src) {
+  if (src.indexOf("script") !== 0) return false;   // not a script at all
+  if (OWN_ID < 0) return true;                      // id unknown, see above
+  if (src === "script") return true;                // no id reported
+  if (src === "script:" + num(OWN_ID)) return true;
+  return false;
+}
+
+// Sources that can only be a person or an external controller: the two
+// physical inputs, the app over the cloud, the web interface and anything
+// that talks to the device over WebSocket, HTTP or MQTT. A report with one
+// of these is never the tail end of our own command, so it counts as manual
+// at once, and it is never mistaken for our own source below. The list need
+// not be complete: any source not on it is placed by the learning in the
+// status handler.
+let HUMAN_SRC = ["button", "switch", "SHC", "WS_in", "http", "HTTP", "cloud", "CLD", "MQTT", "mqtt", "UI"];
+
+let LEARN_SEC = 3;     // a report this soon after our command is its start
+
+function isHumanSource(src) {
+  for (let i = 0; i < HUMAN_SRC.length; i++) {
+    if (HUMAN_SRC[i] === src) return true;
+  }
+  return false;
+}
+
 // ============================================================
 // Main cycle
 // ============================================================
@@ -524,6 +680,24 @@ function tick() {
   let t = now();
   if (t < T_VALID) { log("no valid clock, tracking paused"); return; }
 
+  // What arrived while the clock was not valid yet, dated now.
+  //
+  // A manual report is dated by uptime. Typical after a power cut: the
+  // person straightens the blind by hand before the clock is back, and the
+  // automation must not run over that five minutes later. Dated before
+  // midnight it has already expired, then it changes nothing.
+  if (ST.manualUp >= 0) {
+    let tm = t - (uptime() - ST.manualUp);
+    ST.manualUp = -1;
+    if (localDay(tm) === localDay(t)) markManual(tm, "before clock sync");
+    else log("manual operation before clock sync expired at midnight, ignored");
+  }
+  // A wake call is applied as if it came now. Without this the alarm
+  // would be lost and the blind stays down until dayFallbackHour.
+  if (ST.wakePending) {
+    ST.wakePending = false;
+    if (!isOpened(t) && !isEvening(t)) openDay(t, "alarm, before clock sync");
+  }
   // A value restored from KVS is stamped here, on the first tick with a
   // valid clock, not in loadState() where the clock is usually still 0.
   if (ST.demand !== null && ST.demandTs === 0) ST.demandTs = t;
@@ -533,12 +707,24 @@ function tick() {
   // blind reaches the position the script already believes it is in. The
   // day/night check below is level based, not edge based, so a transition
   // falling on this tick is not lost, only postponed by one.
+  //
+  // Unless the world moved on: a manual operation since the command was
+  // issued wins over it, whatever the command was. And a tracking step is
+  // worthless once the tracking itself has been dropped.
   if (ST.retry !== null) {
     let r = ST.retry;
     ST.retry = null;
-    log("repeating the refused command");
-    sendCmd(r.m, r.p);
-    return;
+    let drop = null;
+    if (ST.manualTs >= r.t) drop = "manual operation since";
+    else if (r.track && !ST.active) drop = "tracking ended since";
+    if (drop !== null) {
+      ST.retryN = 0;
+      log("refused command dropped, " + drop);
+    } else {
+      log("repeating the refused command");
+      sendCmd(r.m, r.p, r.track);
+      return;
+    }
   }
 
   let sun = sunPos(t, CFG.lat, CFG.lon);
@@ -550,6 +736,18 @@ function tick() {
 
   if (ST.phase === null) {
     ST.phase = isDay;              // on startup only remember the phase
+    // A tracking restored from flash while the sun is already down: the end
+    // of the day fell into the outage. The night position, or the end action
+    // where there is none, is still owed. A manual operation before the
+    // outage would have cleared the flag, so nothing is driven over it.
+    if (!isDay && ST.active) {
+      resetTracking();
+      ST.pendingDay = false;
+      log("tracking was running when the script stopped, sun is down now");
+      if (CFG.sunsetAction) drive(CFG.nightPos, CFG.nightSlat);
+      else runEndAction(t, sun.alt);
+      return;
+    }
   } else if (isDay !== ST.phase) {
     ST.phase = isDay;
     resetTracking();
@@ -607,8 +805,8 @@ function tick() {
   // due, so the blind does not travel up and back down seconds later.
   // wakeAlwaysOpen opts out of that and takes the extra movement.
   if (should && ST.pendingDay && CFG.wakeAlwaysOpen) {
-    ST.pendingDay = false;
     drive(CFG.dayPos, CFG.daySlat);
+    ST.pendingDay = false;
     return;                        // shading follows on the next tick
   }
 
@@ -626,8 +824,8 @@ function tick() {
       resetTracking();
       runEndAction(t, sun.alt);
     } else if (ST.pendingDay) {
-      ST.pendingDay = false;
       drive(CFG.dayPos, CFG.daySlat);
+      ST.pendingDay = false;
     }
     return;
   }
@@ -665,11 +863,6 @@ function tick() {
   let started = !ST.active;
   if (!started && !changed) return;
 
-  ST.active = true;
-  ST.lastAng = ang;
-  ST.lastSlat = sp;
-  ST.lastPos = CFG.shadePos;
-  ST.lastMove = t;
   let m2 = "profile=" + num(Math.round(prof));
   m2 = m2 + " -> slat angle=" + num(ang);
   log(m2);
@@ -678,102 +871,198 @@ function tick() {
     m3 = m3 + num(sp);
     log(m3);
   }
-  drive(CFG.shadePos, sp);
+  // Send first, remember second. Should the send itself fail with an error,
+  // the next tick finds a step not yet taken instead of one believed done.
+  drive(CFG.shadePos, sp, true);
+  ST.active = true;
+  ST.lastAng = ang;
+  ST.lastSlat = sp;
+  ST.lastPos = CFG.shadePos;
+  ST.lastMove = t;
+  saveState();                     // the active flag, written on the start only
 }
+
+function tickGuarded() { guard(tick); }
 
 // ============================================================
 // Detect manual operation (button, app, web, cloud)
 // -> pause tracking for the rest of the day
 // ============================================================
-Shelly.addStatusHandler(function (e) {
+function onCoverStatus(e) {
   let want = "cover:" + num(CFG.coverId);
   if (e.component !== want) return;
   if (!e.delta) return;
   if (e.delta.source === undefined) return;
   let src = e.delta.source;
   if (typeof src !== "string") return;
-  if (src.indexOf("script") === 0) return;  // "script", "script:1", ...
-  if (src === "init") return;
-  if (src === "limit_switch") return;
   let t = now();
-  if (t < T_VALID) return;                  // no clock yet, cannot date the flag
-  // Our own command. The cover only reports once the motor has stopped, so
-  // this window has to cover the full travel time of the blind.
-  if (t - ST.selfCmd < CFG.selfCmdSec) return;
-  if (isManual(t)) return;
-  // A manual command in the dark must not consume the coming day. The flag
-  // expires at local midnight, so anything touched between midnight and
-  // sunrise would otherwise block the whole day, day position included.
-  //
-  // Only while the day is still locked, though. After a wake call before
-  // sunrise the blind has already moved on its own, and whoever corrects it
-  // in the dark means it. Between sunset and midnight the day is released as
-  // well, so the flag is set there too, where it changes nothing: it expires
-  // at midnight and the night is over before the automation acts again.
-  let sun = sunPos(t, CFG.lat, CFG.lon);
-  if (sun.alt < CFG.dayNightElev && !isOpened(t)) {
-    log("manual operation (" + src + ") before the day release, automation not paused");
+  let age = t - ST.selfCmd;
+  if (isOwnSource(src)) {
+    // Our own script id. Remembered as the own name as well, so that from
+    // here on every other source can be placed as foreign, see below.
+    if (ST.ownSrc === null && t >= T_VALID && age <= LEARN_SEC) {
+      ST.ownSrc = src;
+      log("own command reported with source " + src + ", learned");
+      saveState();
+    }
     return;
   }
-  ST.manualDay = localDay(t);
-  resetTracking();
-  log("manual operation (" + src + ") -> tracking paused until midnight");
-  saveState();
-});
+  if (src === "init") return;
+  if (src === "limit_switch") return;
+  if (t < T_VALID) {
+    // No clock yet, so the flag cannot be dated. Remembered by uptime and
+    // dated on the first valid tick. No command of ours can be behind it,
+    // nothing is sent without a clock.
+    if (ST.manualUp < 0) ST.manualUp = uptime();
+    log("manual operation (" + src + ") before the clock is valid, remembered");
+    return;
+  }
+  // How the cover names our commands is not documented, and a name the
+  // script does not know would make it pause itself after each of its own
+  // movements. So it learns the name: the motor starts the moment a command
+  // goes out, and the report of that start follows within seconds. Once the
+  // name is known every report of ours can be placed, ours or limit_switch,
+  // and any other source is somebody else, whatever the time says. That is
+  // what lets a person stop the automation the moment it sets off, from a
+  // button, an app or a controller the script has never heard of.
+  //
+  // Until the name is known, a report that cannot be placed counts as ours
+  // inside selfCmdSec, the old rule. And a wrong lesson heals itself: the
+  // learned name showing up while nothing of ours is moving cannot be ours,
+  // so it is forgotten and the report counts as what it is.
+  if (ST.ownSrc !== null && src === ST.ownSrc) {
+    if (age < CFG.selfCmdSec) return;      // our own movement
+    ST.ownSrc = null;
+    log("source " + src + " seen outside our own movement, no longer taken as ours");
+    saveState();
+  } else if (!isHumanSource(src)) {
+    if (ST.ownSrc === null && age <= LEARN_SEC) {
+      ST.ownSrc = src;
+      log("own command reported with source " + src + ", learned");
+      saveState();
+      return;
+    }
+    if (ST.ownSrc === null && age < CFG.selfCmdSec) {
+      log("cover report (" + src + ") inside selfCmdSec, taken as our own");
+      return;
+    }
+  }
+  markManual(t, src);
+}
+
+function coverStatus(e) { guard(onCoverStatus, e); }
+
+Shelly.addStatusHandler(coverStatus);
 
 // ============================================================
 // Receive the heat demand
 //   http://<shelly-ip>/script/1/demand?v=1
 // ============================================================
+// Plain decimal number from a string, null when it is not one. Written out
+// because parseFloat is not part of the documented mJS, and a missing global
+// would kill the script on the first call. Uses slice and indexOf only.
+function toNum(s) {
+  let i = 0;
+  let sign = 1;
+  let c = s.slice(0, 1);
+  if (c === "-") { sign = -1; i = 1; }
+  else if (c === "+") { i = 1; }
+  let v = 0;
+  let frac = 0;
+  let scale = 1;
+  let digits = 0;
+  let dot = false;
+  while (i < s.length) {
+    c = s.slice(i, i + 1);
+    let d = "0123456789".indexOf(c);
+    if (d >= 0) {
+      if (dot) { scale = scale * 10; frac = frac * 10 + d; }
+      else v = v * 10 + d;
+      digits = digits + 1;
+    } else if (c === "." && !dot) {
+      dot = true;
+    } else {
+      return null;
+    }
+    i = i + 1;
+  }
+  if (digits === 0) return null;
+  v = v + frac / scale;
+  return sign * v;
+}
+
+// Value of ?key= as a number, null when absent or unreadable. Accepts 1/0,
+// true/false and on/off as well, so the smart home may send what it has.
 function qval(q, key) {
   if (typeof q !== "string") return null;
   let parts = q.split("&");
   for (let i = 0; i < parts.length; i++) {
     let kv = parts[i].split("=");
-    if (kv[0] === key && kv.length > 1) return parseFloat(kv[1]);
+    if (kv[0] === key && kv.length > 1) {
+      let s = kv[1];
+      if (s === "1" || s === "true" || s === "on") return 1;
+      if (s === "0" || s === "false" || s === "off") return 0;
+      return toNum(s);
+    }
   }
   return null;
 }
 
-HTTPServer.registerEndpoint("demand", function (req, res) {
+// The handlers return true when a cycle should follow. safeEp() runs it
+// after the answer has gone out, under its own guard.
+function onDemand(req, res) {
   let v = qval(req.query, "v");
   let changed = false;
-  if (v !== null && !isNaN(v)) {
+  if (v !== null) {
     let nv = (v > 0.5);
     if (nv !== ST.demand) changed = true;   // only a real flip needs a cycle
     ST.demand = nv;
     ST.demandTs = now();
     saveState();                            // writes only on an actual change
   }
-  let o = { demand: ST.demand, active: ST.active, manual: isManual(now()), window_open: windowOpen(now()) };
+  let t = now();
+  let o = { demand: ST.demand, active: ST.active, manual: isManual(t), window_open: windowOpen(t) };
   res.code = 200;
   res.body = JSON.stringify(o);
   res.send();
-  if (changed) tick();
-});
+  return changed;
+}
 
 // Wake call: releases the day and lets the tick decide what to drive.
 //   http://<shelly-ip>/script/1/wake
-HTTPServer.registerEndpoint("wake", function (req, res) {
+function onWake(req, res) {
   let t = now();
   let fresh = false;
-  // isOpened() is day-stamped, so a stray call after sunset is ignored: the
-  // day was already released this morning. A call before sunrise still works.
-  if (t >= T_VALID && !isOpened(t)) { openDay(t, "alarm"); fresh = true; }
+  if (t < T_VALID) {
+    // No clock yet, typically right after a power cut with the alarm going
+    // off minutes later. Kept and applied on the first valid tick.
+    ST.wakePending = true;
+    log("wake call before the clock is valid, remembered");
+  } else if (isOpened(t)) {
+    // isOpened() is day-stamped, so a stray call after sunset is ignored:
+    // the day was already released this morning. A call before sunrise
+    // still works.
+    log("wake call, day already released");
+  } else if (isEvening(t)) {
+    log("wake call in the evening, ignored");
+  } else {
+    openDay(t, "alarm");
+    fresh = true;
+  }
   let o = { opened: (t > 0 && isOpened(t)), demand: ST.demand, manual: (t > 0 && isManual(t)) };
   res.code = 200;
   res.body = JSON.stringify(o);
   res.send();
-  if (fresh) tick();               // decide immediately, do not wait for the next tick
-});
+  return fresh;                    // decide immediately, do not wait for the next tick
+}
 
 // Window contact: caps the slat angle while the window is open.
 //   http://<shelly-ip>/script/1/window?v=1
-HTTPServer.registerEndpoint("window", function (req, res) {
+function onWindow(req, res) {
   let v = qval(req.query, "v");
   let t = now();
   let before = windowOpen(t);
-  if (v !== null && !isNaN(v)) {
+  if (v !== null) {
     ST.window = (v > 0.5);
     ST.windowTs = t;
     saveState();                            // writes only on an actual change
@@ -785,10 +1074,36 @@ HTTPServer.registerEndpoint("window", function (req, res) {
   res.send();
   // Compare the effect, not the value. Repeating the same value changes
   // nothing, but one arriving after windowMaxAgeH revives a lapsed cap.
-  // And a person opening a window wants air now: the pause guards the motor
+  if (before === after) return false;
+  // A person opening a window wants air now: the pause guards the motor
   // against the drifting sun, not against the two commands a person causes.
-  if (before !== after) { ST.lastMove = 0; tick(); }
-});
+  // Only while the tracking runs, though. Otherwise the cap changes nothing,
+  // and lifting the pause would only let the next start or end action jump
+  // the queue.
+  if (ST.active) ST.lastMove = 0;
+  return true;
+}
+
+// Endpoints answer first and act second. When the handler fails before the
+// answer, the caller gets a 500 instead of waiting for the 10 s timeout. The
+// cycle it asked for runs afterwards, under its own guard.
+function safeEp(f, req, res) {
+  let more = false;
+  try { more = f(req, res); }
+  catch (e) {
+    print("[shade] ERROR in endpoint: " + errText(e));
+    try { res.code = 500; res.body = "{\"error\":true}"; res.send(); } catch (e2) { }
+  }
+  if (more === true) guard(tick);
+}
+
+function epDemand(req, res) { safeEp(onDemand, req, res); }
+function epWake(req, res) { safeEp(onWake, req, res); }
+function epWindow(req, res) { safeEp(onWindow, req, res); }
+
+HTTPServer.registerEndpoint("demand", epDemand);
+HTTPServer.registerEndpoint("wake", epWake);
+HTTPServer.registerEndpoint("window", epWindow);
 
 // ============================================================
 // Startup
@@ -796,6 +1111,8 @@ HTTPServer.registerEndpoint("window", function (req, res) {
 // The values that would otherwise fail silently: a zero slat width divides by
 // zero, two identical calibration points make every angle map to the same
 // position. Both leave a running script that simply never shades correctly.
+function pctOut(v) { return v < 0 || v > 100; }
+
 function checkConfig() {
   if (CFG.slatWidth <= 0) log("CONFIG ERROR: slatWidth must be greater than 0");
   if (CFG.slatDist <= 0) log("CONFIG ERROR: slatDist must be greater than 0");
@@ -806,6 +1123,53 @@ function checkConfig() {
   if (CFG.minElev <= CFG.dayNightElev) log("CONFIG WARNING: minElev not above dayNightElev, the night phase ends the shading before minElev does");
   if (CFG.lat > 90 || CFG.lat < -90) log("CONFIG ERROR: lat outside -90..90");
   if (CFG.lon > 180 || CFG.lon < -180) log("CONFIG ERROR: lon outside -180..180");
+  if (CFG.dayTrigger !== "sun" && CFG.dayTrigger !== "cmd") log("CONFIG ERROR: dayTrigger is neither \"sun\" nor \"cmd\", only dayFallbackHour releases the day");
+  if (CFG.dayFallbackHour < 0 || CFG.dayFallbackHour > 23) log("CONFIG ERROR: dayFallbackHour outside 0..23");
+  if (pctOut(CFG.shadePos)) log("CONFIG ERROR: shadePos outside 0..100");
+  if (pctOut(CFG.dayPos) || pctOut(CFG.daySlat)) log("CONFIG ERROR: dayPos or daySlat outside 0..100");
+  if (pctOut(CFG.nightPos) || pctOut(CFG.nightSlat)) log("CONFIG ERROR: nightPos or nightSlat outside 0..100");
+  if (CFG.tickSec < 10) log("CONFIG ERROR: tickSec below 10 s, the device would do little else");
+  if (CFG.intervalMin < 0) log("CONFIG ERROR: intervalMin must not be negative");
+  if (CFG.selfCmdSec < 0) log("CONFIG ERROR: selfCmdSec must not be negative");
+  if (CFG.demandMaxAgeH <= 0) log("CONFIG ERROR: demandMaxAgeH must be greater than 0");
+  if (CFG.windowMaxAgeH <= 0) log("CONFIG ERROR: windowMaxAgeH must be greater than 0");
+}
+
+// The cover itself. Everything the script sends is refused when the device
+// is not in the Cover profile, not calibrated, or has slat control disabled,
+// and the log would only ever show the refusals one at a time. Runs once the
+// device has settled, not in the first second of the boot.
+function checkCover() {
+  let key = "cover:" + num(CFG.coverId);
+  let st = Shelly.getComponentStatus(key);
+  if (!st) { log("CONFIG ERROR: " + key + " not found, is the device in the Cover profile?"); return; }
+  if (st.pos_control !== true) log("CONFIG ERROR: cover not calibrated, every position command is refused");
+  if (CFG.slats && st.slat_pos === undefined) log("CONFIG ERROR: cover reports no slat_pos, slat control is not enabled");
+  let cf = Shelly.getComponentConfig(key);
+  if (!cf) return;
+  let mt = 0;
+  if (typeof cf.maxtime_open === "number") mt = cf.maxtime_open;
+  if (typeof cf.maxtime_close === "number" && cf.maxtime_close > mt) mt = cf.maxtime_close;
+  if (mt > CFG.selfCmdSec) {
+    let m = "CONFIG WARNING: selfCmdSec " + num(CFG.selfCmdSec);
+    m = m + " is below the cover travel time of up to " + num(mt);
+    m = m + " s, own movements could count as manual operation";
+    log(m);
+  }
+}
+
+// The first tick waits for the clock. Without NTP right after a boot, a
+// power cut for example, it is checked every 15 s instead of once per
+// tickSec, so the automation starts seconds after the clock is back, not
+// minutes. The periodic tick runs alongside and simply returns until then.
+function waitClock() {
+  if (now() < T_VALID) { Timer.set(15000, false, waitClock); return; }
+  guard(tick);
+}
+
+function firstRun() {
+  guard(checkCover);
+  waitClock();
 }
 
 function init() {
@@ -814,8 +1178,8 @@ function init() {
   log(m);
   checkConfig();
   loadState();
-  Timer.set(CFG.tickSec * 1000, true, tick);
-  Timer.set(15000, false, tick);   // first run once the clock is in sync
+  Timer.set(CFG.tickSec * 1000, true, tickGuarded);
+  Timer.set(15000, false, firstRun);   // once the device has settled
 }
 
 init();
