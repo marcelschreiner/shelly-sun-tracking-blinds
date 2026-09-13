@@ -1,10 +1,9 @@
 # Shelly Sun Tracking Blinds
 
-Autonomous venetian blind control as a Shelly script. The device computes the solar
-position itself, derives the slat angle that blocks direct sunlight, and tracks it
-through the day. No server, no broker, no cloud.
+Autonomous blind control as a Shelly script. The device computes the solar position itself, derives the slat angle that blocks direct sunlight, and tracks it through the day. 
 
-Tested on Shelly Gen2 and newer in the Cover profile.
+> [!NOTE]
+> No server, no broker, no cloud.
 
 ## What it uses
 
@@ -16,10 +15,7 @@ Tested on Shelly Gen2 and newer in the Cover profile.
 | **Window contact** | your smart home, via `/window` | blocks any downward travel |
 | **Manual operation** | the button, app or web interface | pauses automation until midnight |
 
-Only the sun position is required. Every other input is optional, has a fallback, and
-reaches the device as a plain yes/no over HTTP. The Shelly stays the only controller:
-**no schedule on your smart home platform may write to the same cover**, or the script
-cannot tell an automation from a manual command and locks itself out for the day.
+Only the sun position is required. Every other input is optional, has a fallback, and reaches the device as a plain yes/no over HTTP. The Shelly stays the only controller: **no schedule on your smart home platform may write to the same cover**, or the script cannot tell an automation from a manual command and locks itself out for the day.
 
 ## Quick start
 
@@ -32,24 +28,22 @@ cannot tell an automation from a manual command and locks itself out for the day
 
 ## Calibration
 
-The one step that cannot be computed. Two values must be measured, the slat angle at
-each end of the tilt travel:
-
-- `angAtPos0` — the angle at `slat_pos` 0
-- `angAtPos100` — the angle at `slat_pos` 100
+To calibrate the slat positions, 2 values must be measured:
+- Angle when slats are fully closed `angAtPos0`
+- Angle when slats are fully open `angAtPos100`
 
 <img src="docs/calibration.svg" alt="Slat angle at both mechanical end positions" width="620">
 
-Drive `slat_pos` to each end in the web interface, lay a phone with a spirit level app flat on a slat and read off the angle. Positive means the room-side edge points up, negative values are fine.
-
-Do not assume `slat_pos` 0 is the closed side. It is a percentage of the tilt travel, not an angle, and the polarity depends on the wiring.
+Drive `slat_pos` to each end in the web interface, lay a phone with a level app flat on a slat and read off the angle. 
+- Positive angles mean the room-side edge points up
+- Negative angles mean the outside-side edge points up
 
 ## Configuration
 
-All settings live in the `CFG` block at the top of the script. Only some are checked
-when it starts: the slat dimensions, the two calibration points, `stepDeg`, the
-tolerances and the coordinates. The rest are trusted, and an out of range value simply
-behaves oddly rather than failing loudly.
+All settings are located in the `CFG` block at the top of the script. 
+
+> [!WARNING]
+> Ensure that the entered values are within the specified range. Out of range values can lead to unknown behavior.
 
 ### Location and window
 
@@ -61,7 +55,7 @@ behaves oddly rather than failing loudly.
 | `lon` | Longitude | ° | −180…180 | — |
 | `azimuth` | Window facing direction, 0=N, 90=E, 180=S, 270=W | ° | 0…360 | `180` |
 | `tolStart` / `tolEnd` | Direction tolerance as the sun enters and leaves | ° | 0…90 | `85` |
-| `minElev` | Minimum solar elevation for shading | ° | 0…90 | `5` |
+| `minElev` | Minimum solar elevation for shading (degrees above horizon) | ° | 0…90 | `5` |
 | `coverId` | Only relevant on devices with two covers | — | 0…1 | `0` |
 
 ### Slats and tracking
@@ -121,25 +115,51 @@ Each one answers with the current state as JSON and triggers a cycle immediately
 
 Examples are Apple Home; the principle holds anywhere. Join the Shelly over Matter and drive the endpoints from your automations.
 
-**Room temperature.** Two automations per room: above the upper threshold call
-`demand?v=1`, below the lower one `demand?v=0`. The hysteresis therefore lives in the
-app and can differ per room. In Apple Home use *Convert to Shortcut* and *Get Contents
-of URL*, which runs on the home hub without a phone.
+<details>
+<summary><b>Room temperature</b></summary>
+<br>
 
-**Window contact.** One automation per window, opened and closed. Any sensor the
-platform can read will do. Shelly BLU sensors need a bridge such as Matterbridge or
-Homebridge, they cannot join Apple Home directly.
+Two automations per room: above the upper threshold call `demand?v=1`, below the lower one `demand?v=0`. The hysteresis therefore lives in the app and can differ per room. In Apple Home use *Convert to Shortcut* and *Get Contents of URL*, which runs on the home hub without a phone.
 
-**Alarm clock.** A personal shortcut automation on *When my alarm is stopped*, calling
-`/wake`, with *Ask Before Running* off. This one runs on the phone; a fixed-time home
-automation works too but loses the link to the actual alarm.
+<br>
+</details>
+
+<details>
+<summary><b>Window contact</b></summary>
+<br>
+
+One automation per window, opened and closed. Call `/script/1/window?v=1` when the window was opened `/script/1/window?v=0` when closed
+
+<br>
+</details>
+
+<details>
+<summary><b>Alarm clock</b></summary>
+<br>
+
+A personal shortcut automation on *When my alarm is stopped*, calling `/wake`, with *Ask Before Running* off. This one runs on the phone; a fixed-time home automation works too but loses the link to the actual alarm.
+
+<br>
+</details>
+
 
 ## How it works
 
-**Solar position.** NOAA approximation from the device unix time, below 0.01 degrees of
+<details>
+<summary><b>Solar position</b></summary>
+<br>
+
+NOAA approximation from the device unix time, below 0.01 degrees of
 error, verified against the theoretical solstice elevations.
 
-**Slat angle.** The profile angle `p` is the sun's apparent angle in the window plane,
+<br>
+</details>
+
+<details>
+<summary><b>Slat angle</b></summary>
+<br>
+
+The profile angle `p` is the sun's apparent angle in the window plane,
 from `h` (elevation) and `γ` (azimuth minus window orientation). The cut-off angle `β`
 is the flattest slat angle that still shades, see the
 [diagram](#slats-and-tracking) above:
@@ -151,12 +171,29 @@ p = atan( tan(h) / cos(γ) )      sin(β + p) = (d / w) · cos(p)
 If `d > w` the blind never closes tightly and the script clamps to the steepest value
 it can reach.
 
-**Rounding.** Always towards closed, in steps of `stepDeg`. Rounding to the nearest
+<br>
+</details>
+
+<details>
+<summary><b>Rounding</b></summary>
+<br>
+
+Always towards closed, in steps of `stepDeg`. Rounding to the nearest
 step would let a stripe of sun through on every second step; rounding one way also
 leaves half a step of margin for the mechanical play of the blind.
 
-**When it shades.** Only when all of it holds: no manual override, day released, heat
+<br>
+</details>
+
+<details>
+<summary><b>When it shades</b></summary>
+<br>
+
+Only when all of it holds: no manual override, day released, heat
 demand active, window closed, sun inside the sector and above `minElev`.
+
+<br>
+</details>
 
 ### Window guard
 
@@ -195,16 +232,14 @@ Manual override and day release are stored as local day numbers, not booleans, s
 expire at midnight on their own and survive a reboot without going stale. Three
 consequences:
 
-- A wake call after sunset does nothing, the day was already released that morning. One
-  before sunrise still works, which is what a winter alarm needs.
-- Manual operation below `dayNightElev` does not pause anything. Otherwise adjusting
-  the blind at three in the morning would block the whole coming day.
-- A wake call while shading is already due skips the day position, instead of
-  travelling up and back down seconds later.
+- A wake call after sunset does nothing, the day was already released that morning. One before sunrise still works, which is what a winter alarm needs.
+- Manual operation below `dayNightElev` does not pause anything. Otherwise adjusting the blind at three in the morning would block the whole coming day.
+- A wake call while shading is already due skips the day position, instead of travelling up and back down seconds later.
+
 
 ## Autonomy
 
-A single device keeps working when everything else fails.
+The script is designed to run as autonomously as possible. These failure cases are handled as follows:
 
 | Failure | Behaviour |
 |---|---|
@@ -216,31 +251,38 @@ A single device keeps working when everything else fails.
 | No valid clock after boot | Tracking pauses instead of driving to a wrong position |
 | Window contact stops reporting while open | Blind stays up. No season to fall back on, so it errs towards not moving; `window?v=0` clears it |
 
+
 ## Notes on the code
 
-**Flash wear.** The ESP32 tolerates roughly 100,000 writes per sector. Only what cannot
-be derived again is persisted: override day, heat demand, day release, window state.
-`saveState()` compares against the last written content, which turns several hundred
-writes a day into a handful. Everything else lives in RAM.
+<details>
+<summary><b>Flash wear</b></summary>
+<br>
 
-**mJS is not full JavaScript.** Only `sin`, `cos`, `floor`, `ceil`, `round`, `min`,
-`max`, `pow`, `exp`, `log` and `random` exist, so `atan2`, `atan`, `asin`, `tan`, `sqrt`
-and `PI` are implemented in the script. And the stack is small: nested expressions
-overflow it, which is why everything is deliberately flat and uses intermediate
-variables. It looks clumsy, and it is the reason the script runs at all.
+The ESP32 tolerates roughly 100,000 writes per sector. Only what cannot be derived again is persisted: override day, heat demand, day release, window state. `saveState()` compares against the last written content, which turns several hundred writes a day into a handful. Everything else lives in RAM.
+
+<br>
+</details>
+
+<details>
+<summary><b>mJS is not full JavaScript</b></summary>
+<br>
+
+Only `sin`, `cos`, `floor`, `ceil`, `round`, `min`, `max`, `pow`, `exp`, `log` and `random` exist, so `atan2`, `atan`, `asin`, `tan`, `sqrt` and `PI` are implemented in the script. And the stack is small: nested expressions overflow it, which is why everything is deliberately flat and uses intermediate variables. It looks clumsy, and it is the reason the script runs at all.
+
+<br>
+</details>
+
 
 ## Tests
 
-`shading.js` runs unmodified under node, against a stub of the Shelly runtime and a
-virtual clock.
+`shading.js` runs unmodified under node, against a stub of the Shelly runtime and a virtual clock.
+
+Covers the solar position against the theoretical solstice elevations, the day release, manual override and wake behaviour, the window guard, what survives a reboot, and the flash write budget.
 
 ```bash
 node test/run.js
 ```
 
-Covers the solar position against the theoretical solstice elevations, the day release,
-manual override and wake behaviour, the window guard, what survives a reboot, and the
-flash write budget.
 
 ## License
 
