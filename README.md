@@ -13,7 +13,7 @@ Autonomous blind control as a Shelly script. The device computes the solar posit
 | **Room temperature** | your smart home, via `/demand` | whether to shade at all |
 | **Alarm clock** | your smart home, via `/wake` | releases the day, blind opens |
 | **Window contact** | your smart home, via `/window` | keeps a gap in the slats for the air |
-| **Manual operation** | the button, app or web interface | pauses automation until midnight |
+| **Manual operation** | the button, app or web interface | pauses automation until midnight, the night position aside |
 
 Only the sun position is required. Every other input is optional, has a fallback, and reaches the device as a plain yes/no over HTTP. The Shelly stays the only controller: **no schedule on your smart home platform may write to the same cover**, or the script cannot tell an automation from a manual command and locks itself out for the day.
 
@@ -55,7 +55,7 @@ All settings are located in the `CFG` block at the top of the script.
 | `lon` | Longitude | ° | −180…180 | — |
 | `azimuth` | Window facing direction, 0=N, 90=E, 180=S, 270=W | ° | 0…360 | `180` |
 | `tolStart` / `tolEnd` | Direction tolerance as the sun enters and leaves | ° | 0…90 | `85` |
-| `minElev` | Minimum solar elevation for shading (degrees above horizon) | ° | 0…90 | `5` |
+| `minElev` | Minimum solar elevation for shading (degrees above horizon), keep above `dayNightElev` | ° | 0…90 | `5` |
 | `coverId` | Only relevant on devices with two covers | — | 0…1 | `0` |
 
 ### Slats and tracking
@@ -185,7 +185,9 @@ Always towards closed, in steps of `stepDeg`. Rounding to the nearest step would
 <summary><b>When it shades</b></summary>
 <br>
 
-Only when all of it holds: no manual override, day released, heat demand active, sun inside the sector and above `minElev`.
+Only when all of it holds: day phase, day released, no manual override, heat demand active, sun inside the sector and above `minElev`.
+
+The day phase is part of it so that a `minElev` below `dayNightElev` cannot restart the tracking minutes after the night position was driven. What the pause does **not** stop is the night position at sunset: one movement a day happens whatever was set by hand, and the flag expires an hour or two later anyway.
 
 <br>
 </details>
@@ -261,11 +263,12 @@ stateDiagram-v2
 stays off, so the morning sun cannot wake anyone. With `"sun"` the state is skipped.
 
 Manual override and day release are stored as local day numbers, not booleans, so they
-expire at midnight on their own and survive a reboot without going stale. Three
+expire at midnight on their own and survive a reboot without going stale. Four
 consequences:
 
 - A wake call after sunset does nothing, the day was already released that morning. One before sunrise still works, which is what a winter alarm needs.
-- Manual operation below `dayNightElev` does not pause anything. Otherwise adjusting the blind at three in the morning would block the whole coming day.
+- Manual operation below `dayNightElev` pauses nothing **while the day is still locked**. Otherwise adjusting the blind at three in the morning would block the whole coming day. Once the day is released the pause counts, dark or not: after a wake call before sunrise the blind has already moved on its own, and whoever corrects it then means it.
+- The day release wins over a manual override and clears it, whether it came from `/wake`, from sunrise or from `dayFallbackHour`. Otherwise one tilt in the hour before the release would cost the whole day of shading, and only in `"cmd"` mode, which is nobody's idea of a pause.
 - A wake call while shading is already due skips the day position, instead of travelling up and back down seconds later.
 
 <br>
@@ -288,7 +291,7 @@ The script is designed to run as autonomously as possible. These failure cases a
 | Stored state unreadable, half written or from an older version | Ignored, the script starts from its defaults instead of dying at startup |
 | Device reports no `utc_offset` | Falls back to UTC and warns once. `dayFallbackHour` and the midnight rollover shift with it |
 | Computed angle outside the calibrated range | Clamped to the nearer end position, and logged |
-| A movement command is rejected | Logged, but the script still assumes the blind followed. It corrects itself on the next angle step |
+| A movement command is rejected | Logged and repeated on the next tick, up to three times. Day and night position have no second chance otherwise, the tracking would correct itself on its next angle step |
 
 
 ## Notes on the code

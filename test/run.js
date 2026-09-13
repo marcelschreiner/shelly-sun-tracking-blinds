@@ -20,6 +20,7 @@ let T = 0;            // virtual clock, unix seconds
 let drives = [];      // every cover command the script issued
 let writes = 0;       // KVS.Set calls, the flash write budget
 let kvs = null;       // the one persisted record
+let failCover = false; // true = the cover refuses every command
 let eps = {};         // registered HTTP endpoints
 let onStatus = null;  // the cover status handler
 
@@ -41,7 +42,7 @@ function boot() {
         }
         if (m === 'KVS.Set') { writes++; kvs = p.value; return cb && cb(null, 0); }
         drives.push({ m, p });
-        if (cb) cb(null, 0);
+        if (cb) cb(null, failCover ? -114 : 0, 'busy');
       }
     }
   };
@@ -142,6 +143,45 @@ T = NOON + 600;
 manual('script:1');
 check('the script itself is not manual', X.ST.manualDay === -1);
 
+// A wake call before sunrise moves the blind on its own. Correcting that in
+// the dark is a deliberate act, not the three in the morning case the night
+// rule is there for.
+const WDARK = Date.UTC(2025, 11, 21, 5, 0, 0) / 1000;   // 07:00 local, sun still down
+const WSUN = Date.UTC(2025, 11, 21, 9, 0, 0) / 1000;    // sun up and inside the sector
+function winterMorning() {
+  kvs = null;
+  X = boot();
+  X.CFG.demandMaxAgeH = 9999;    // December is outside fallbackMonths
+  at(WDARK);
+  ep('demand', 'v=1');
+  ep('wake', '');                // the alarm releases the day and opens
+}
+winterMorning();
+at(WSUN);
+check('control: without a manual command the shading runs', X.ST.active === true);
+
+winterMorning();
+T = WDARK + 600;                 // still dark, day already released
+manual('WS_in');
+check('manual after the day release pauses, dark or not', X.ST.manualDay === X.localDay(T));
+drives = [];
+at(WSUN);
+check('and the shading does not drive over it', drives.length === 0, JSON.stringify(drives));
+check('tracking stays off', X.ST.active === false);
+
+// The pause must not lock the day out of the automation altogether, or one
+// tilt at seven in the morning costs a whole day of shading.
+kvs = null; X = boot();
+at(MORNING);                     // 07:00 local, day still locked
+T = MORNING + 600;
+manual('WS_in');
+check('manual before the release pauses too', X.ST.manualDay === X.localDay(T));
+at(D(8, 0));                     // 10:00 local, past dayFallbackHour
+check('the release goes through anyway', X.ST.openedDay === X.localDay(T));
+check('and clears the override', X.ST.manualDay === -1);
+at(NOON);
+check('so the day is shaded after all', X.ST.active === true);
+
 // ============================================================
 group('end actions');
 // Each variant needs its own boot. Once the tracking has ended it stays
@@ -165,6 +205,54 @@ d = endAction(3);
 check('endAction=slats-horizontal drives shadePos', d.length === 1 && d[0].p.pos === 0, JSON.stringify(d));
 d = endAction(0);
 check('endAction=nothing drives nothing', d.length === 0, JSON.stringify(d));
+
+// ============================================================
+group('night phase');
+// A minElev below dayNightElev used to restart the tracking minutes after
+// the night position had been driven. The phase decides, not the elevation
+// alone.
+kvs = null; X = boot();
+X.CFG.azimuth = 270;             // west window, the sun stays in the sector until it sets
+X.CFG.dayNightElev = 10;
+X.CFG.minElev = 5;
+at(Date.UTC(2025, 5, 21, 18, 0, 0) / 1000);    // 11 degrees up, still day
+check('shading runs before the switch', X.ST.active === true);
+at(Date.UTC(2025, 5, 21, 18, 30, 0) / 1000);   // 7 degrees, below dayNightElev
+check('night position driven', drives.length === 1 && drives[0].p.pos === X.CFG.nightPos,
+      JSON.stringify(drives));
+at(Date.UTC(2025, 5, 21, 18, 40, 0) / 1000);   // 6 degrees, still above minElev
+check('nothing reopens behind it', drives.length === 0, JSON.stringify(drives));
+check('and the tracking stays off', X.ST.active === false);
+
+// ============================================================
+group('refused commands');
+// The runtime never repeats a refused command, and pendingDay is spent by
+// the time the day position fails. Without the retry the blind would stay in
+// the night position for the rest of the day.
+kvs = null; X = boot();
+at(MORNING);
+failCover = true;
+drives = [];
+ep('wake', '');
+check('the day position is attempted', drives.length === 1 && drives[0].p.pos === 100,
+      JSON.stringify(drives));
+failCover = false;
+at(MORNING + 300);
+check('and repeated on the next tick', drives.length === 1 && drives[0].p.pos === 100,
+      JSON.stringify(drives));
+at(MORNING + 600);
+check('once it goes through nothing is repeated again', drives.length === 0, JSON.stringify(drives));
+
+// A cover that stays busy must not be hammered for ever.
+kvs = null; X = boot();
+at(MORNING);
+failCover = true;
+ep('wake', '');
+let repeats = 0;
+for (let i = 1; i <= 6; i++) { at(MORNING + i * 300); repeats += drives.length; }
+failCover = false;
+check('a command that keeps failing is dropped', repeats === 3, 'repeats=' + repeats);
+check('and the retry slot is free again', X.ST.retry === null && X.ST.retryN === 0);
 
 // ============================================================
 group('window contact, the slat cap');

@@ -12,8 +12,10 @@
 //   http://<shelly-ip>/script/1/window?v=0   -> window closed again
 //
 // Manual operation of the cover pauses the automation for the rest of the
-// local day. Both that flag and the day release are stored as day numbers,
-// so they expire at local midnight and survive a reboot without going stale.
+// local day: no day position, no shading, no end action. The night position
+// at sunset runs anyway, it is the one movement the pause does not stop.
+// Both that flag and the day release are stored as day numbers, so they
+// expire at local midnight and survive a reboot without going stale.
 //
 // NOTE on code style: mJS has a very small stack and evaluates
 // expressions recursively. Deeply nested terms and long concatenations
@@ -313,7 +315,9 @@ let ST = {
   openedDay: -1,       // day on which the day position was released
   pendingDay: false,   // day position still to be driven if no shading
   window: null,        // true = open, false = closed, null = never reported
-  windowTs: 0          // 0 = restored but not yet stamped, see tick()
+  windowTs: 0,         // 0 = restored but not yet stamped, see tick()
+  retry: null,         // command the cover refused, resent on the next tick
+  retryN: 0            // consecutive failures, see RETRY_MAX
 };
 
 let saved = "";        // content last written to flash
@@ -409,14 +413,36 @@ function windowOpen(t) {
 
 // ============================================================
 // Movement commands
+//
+// A refused command is gone: the runtime never repeats it and the script
+// would keep believing the blind followed. Everything therefore goes through
+// sendCmd, which keeps the failed command for the next tick. Without that a
+// cover that was busy for a moment loses its day or night position for the
+// whole day. Only the tracking heals itself, on its next angle step.
 // ============================================================
+let RETRY_MAX = 3;     // repeats of a refused command before it is dropped
+
+function sendCmd(m, p) {
+  ST.selfCmd = now();
+  Shelly.call(m, p, function (res, err, msg) {
+    if (err === 0) { ST.retryN = 0; return; }
+    rpcDone(res, err, msg);
+    ST.retryN = ST.retryN + 1;
+    if (ST.retryN > RETRY_MAX) {
+      ST.retryN = 0;
+      log("command dropped after " + num(RETRY_MAX) + " repeats");
+      return;
+    }
+    ST.retry = { m: m, p: p };
+  });
+}
+
 function drive(pos, slatPos) {
   let p = { id: CFG.coverId, pos: pos };
   if (CFG.slats && slatPos !== null) p.slat_pos = slatPos;
-  ST.selfCmd = now();
   // Position and slats must be sent in ONE call, otherwise the second
   // command overrides the first.
-  Shelly.call("Cover.GoToPosition", p, rpcDone);
+  sendCmd("Cover.GoToPosition", p);
   let m = "drive pos=" + num(pos);
   m = m + " slat=" + num(slatPos);
   log(m);
@@ -439,13 +465,11 @@ function runEndAction(t, alt) {
     if (alt < near) { log("tracking ended, end action skipped, sunset is near"); return; }
   }
   if (CFG.endAction === 1) {
-    ST.selfCmd = t;
     ST.lastMove = t;
-    Shelly.call("Cover.Open", { id: CFG.coverId }, rpcDone);
+    sendCmd("Cover.Open", { id: CFG.coverId });
   } else if (CFG.endAction === 2) {
-    ST.selfCmd = t;
     ST.lastMove = t;
-    Shelly.call("Cover.Close", { id: CFG.coverId }, rpcDone);
+    sendCmd("Cover.Close", { id: CFG.coverId });
   } else if (CFG.endAction === 3) {
     ST.lastMove = t;
     drive(CFG.shadePos, angleToSlatPos(0));
@@ -486,7 +510,7 @@ function isOpened(t) { return ST.openedDay === localDay(t); }
 // The tick then decides between day position and shading.
 function openDay(t, why) {
   ST.openedDay = localDay(t);
-  ST.manualDay = -1;               // a wake call or sunrise wins over an override
+  ST.manualDay = -1;               // the day release wins over an override
   resetTracking();
   ST.pendingDay = true;
   log("day released (" + why + ")");
@@ -504,6 +528,18 @@ function tick() {
   // valid clock, not in loadState() where the clock is usually still 0.
   if (ST.demand !== null && ST.demandTs === 0) ST.demandTs = t;
   if (ST.window !== null && ST.windowTs === 0) ST.windowTs = t;
+
+  // A refused command is repeated before anything else is decided, so the
+  // blind reaches the position the script already believes it is in. The
+  // day/night check below is level based, not edge based, so a transition
+  // falling on this tick is not lost, only postponed by one.
+  if (ST.retry !== null) {
+    let r = ST.retry;
+    ST.retry = null;
+    log("repeating the refused command");
+    sendCmd(r.m, r.p);
+    return;
+  }
 
   let sun = sunPos(t, CFG.lat, CFG.lon);
 
@@ -529,7 +565,13 @@ function tick() {
 
   // Day release. Deliberately outside the transition block so that it also
   // fires when the script starts up in the middle of a day.
-  if (isDay && !isOpened(t) && !isManual(t)) {
+  //
+  // A manual override does not block it. The release clears the override,
+  // exactly as a wake call does. Otherwise someone tilting the blind before
+  // the release, in the hour between sunrise and dayFallbackHour, would lock
+  // the whole day out of the automation, shading included, which is the one
+  // thing the pause is not meant to do.
+  if (isDay && !isOpened(t)) {
     if (CFG.dayTrigger === "sun") {
       openDay(t, "sun");
     } else if (localHour(t) >= CFG.dayFallbackHour) {
@@ -547,7 +589,11 @@ function tick() {
 
   let demand = shadingDemand(t);
   let should = false;
-  if (!isManual(t) && isOpened(t) && demand && inSector && sun.alt >= CFG.minElev) should = true;
+  // isDay, not only minElev: a minElev below dayNightElev would otherwise
+  // restart the tracking minutes after the night position was driven.
+  if (isDay && isOpened(t) && !isManual(t)) {
+    if (demand && inSector && sun.alt >= CFG.minElev) should = true;
+  }
 
   let m = "alt=" + num(Math.round(sun.alt));
   m = m + " az=" + num(Math.round(sun.az));
@@ -658,9 +704,15 @@ Shelly.addStatusHandler(function (e) {
   // A manual command in the dark must not consume the coming day. The flag
   // expires at local midnight, so anything touched between midnight and
   // sunrise would otherwise block the whole day, day position included.
+  //
+  // Only while the day is still locked, though. After a wake call before
+  // sunrise the blind has already moved on its own, and whoever corrects it
+  // in the dark means it. Between sunset and midnight the day is released as
+  // well, so the flag is set there too, where it changes nothing: it expires
+  // at midnight and the night is over before the automation acts again.
   let sun = sunPos(t, CFG.lat, CFG.lon);
-  if (sun.alt < CFG.dayNightElev) {
-    log("manual operation (" + src + ") at night, automation not paused");
+  if (sun.alt < CFG.dayNightElev && !isOpened(t)) {
+    log("manual operation (" + src + ") before the day release, automation not paused");
     return;
   }
   ST.manualDay = localDay(t);
@@ -751,6 +803,7 @@ function checkConfig() {
   if (CFG.stepDeg <= 0) log("CONFIG ERROR: stepDeg must be greater than 0");
   if (!angleReachable(CFG.windowAng)) log("CONFIG WARNING: windowAng outside the calibrated range, the cap cannot be reached");
   if (CFG.tolEnd < CFG.tolStart) log("CONFIG WARNING: tolEnd below tolStart, the sector edge can flap");
+  if (CFG.minElev <= CFG.dayNightElev) log("CONFIG WARNING: minElev not above dayNightElev, the night phase ends the shading before minElev does");
   if (CFG.lat > 90 || CFG.lat < -90) log("CONFIG ERROR: lat outside -90..90");
   if (CFG.lon > 180 || CFG.lon < -180) log("CONFIG ERROR: lon outside -180..180");
 }
