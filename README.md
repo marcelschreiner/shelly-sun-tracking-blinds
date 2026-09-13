@@ -204,6 +204,41 @@ A contact speaks only when it changes, so silence is normal while a window stays
 </details>
 
 <details>
+<summary><b>The tick cycle</b></summary>
+<br>
+
+```mermaid
+flowchart TD
+    A["Tick every tickSec"] --> B{"Clock valid?"}
+    B -->|no| Z["do nothing"]
+    B -->|yes| C["Compute solar position"]
+    C --> D{"Day/night<br/>changed?"}
+    D -->|"to night"| N["Drive night position"]
+    D -->|"to day, or no change"| E["Release the day<br/>per dayTrigger"]
+    E --> F{"Shade?"}
+    F -->|no| G{"Day position<br/>pending?"}
+    G -->|yes| H["Drive day position"]
+    G -->|no| I{"Tracking<br/>was running?"}
+    I -->|yes| J["End action,<br/>once the pause is over"]
+    I -->|no| Z
+    F -->|yes| K["Cut-off angle,<br/>rounded towards closed"]
+    K --> W{"Window<br/>open?"}
+    W -->|yes| X["Cap the angle<br/>at windowAng"]
+    W -->|no| L
+    X --> L{"Pause over and<br/>angle changed?"}
+    L -->|yes| M["Drive curtain and slats<br/>in a single call"]
+    L -->|no| Z
+
+    style M fill:#2d6a4f,color:#fff
+    style N fill:#1d3557,color:#fff
+```
+
+The day release sits outside the day/night branch on purpose, so it also fires when the script starts up in the middle of a day.
+
+<br>
+</details>
+
+<details>
 <summary><b>Day cycle</b></summary>
 <br>
 
@@ -250,6 +285,10 @@ The script is designed to run as autonomously as possible. These failure cases a
 | Clock synchronises late after boot | Restored heat demand and window state are stamped on the first valid tick |
 | No valid clock after boot | Tracking pauses instead of driving to a wrong position |
 | Window report older than `windowMaxAgeH` | Cap is dropped, the slats go back to the regular angle |
+| Stored state unreadable, half written or from an older version | Ignored, the script starts from its defaults instead of dying at startup |
+| Device reports no `utc_offset` | Falls back to UTC and warns once. `dayFallbackHour` and the midnight rollover shift with it |
+| Computed angle outside the calibrated range | Clamped to the nearer end position, and logged |
+| A movement command is rejected | Logged, but the script still assumes the blind followed. It corrects itself on the next angle step |
 
 
 ## Notes on the code
