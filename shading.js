@@ -52,13 +52,13 @@ let CFG = {
   angAtPos100: -10,      // measured angle at slat_pos = 100
   stepDeg: 15,           // tracking granularity
   intervalMin: 20,       // minimum pause between two movements, also between
-                         // start, end and restart of the tracking
-  selfCmdSec: 90,        // the longest a movement of ours can take, from the
-                         // command to the report that the motor has stopped.
-                         // Reports of our own source later than this are not
-                         // ours. Until the script has learned its own source
-                         // (see the status handler) any report it cannot place
-                         // inside this window counts as ours as well.
+  // start, end and restart of the tracking
+  selfCmdSec: 120,       // the longest a movement of ours can take, from the
+  // command to the report that the motor has stopped.
+  // Reports of our own source later than this are not
+  // ours. Until the script has learned its own source
+  // (see the status handler) any report it cannot place
+  // inside this window counts as ours as well.
 
   mode: 1,               // 0 = maximum daylight, 1 = maximum cooling
   coolExtra: 20,         // extra degrees towards closed in mode 1
@@ -68,9 +68,9 @@ let CFG = {
   shadePos: 0,
   endAction: 1,          // 0=nothing, 1=open, 2=close, 3=slats horizontal
   endSkipDeg: 8,         // no end action once the sun is this close to
-                         // dayNightElev, the sunset action follows anyway.
-                         // Keep it above minElev, otherwise the evening exit
-                         // by elevation still opens the blind for minutes.
+  // dayNightElev, the sunset action follows anyway.
+  // Keep it above minElev, otherwise the evening exit
+  // by elevation still opens the blind for minutes.
 
   // --- Day boundaries. Replaces the schedules in the smart home app so
   // that no second controller writes to the same cover.
@@ -79,7 +79,7 @@ let CFG = {
   dayTrigger: "cmd",
   dayFallbackHour: 9,    // "cmd" only: opens anyway if no command arrives
   wakeAlwaysOpen: false, // true = always fully open on wake, even when
-                         //        shading would be due immediately
+  //        shading would be due immediately
   sunsetAction: true,    // close at sunset
   dayPos: 100, daySlat: 100,      // day position (100 = fully up)
   nightPos: 0, nightSlat: 0,      // night position (0 = closed, slats closed)
@@ -87,15 +87,15 @@ let CFG = {
 
   // --- Window contact, optional. Both values do nothing without one.
   windowAng: 60,         // while the window is reported open the slats stay at
-                         // or below this angle, so air still passes. Lower
-                         // means more air and less shade.
+  // or below this angle, so air still passes. Lower
+  // means more air and less shade.
   windowMaxAgeH: 72,     // after this the report counts as lost and the cap
-                         // is dropped. A contact only reports on a change, so
-                         // this has to outlast the longest airing.
+  // is dropped. A contact only reports on a change, so
+  // this has to outlast the longest airing.
 
   // --- Heat demand
   demandMaxAgeH: 24,               // after this the report counts as lost
-  fallbackMonths: [4,5,6,7,8,9],   // without a valid report the season decides
+  fallbackMonths: [4, 5, 6, 7, 8, 9],   // without a valid report the season decides
 
   tickSec: 300,
   debug: true
@@ -311,10 +311,10 @@ let ST = {
   manualDay: -1,       // day on which manual operation was detected
   manualTs: 0,         // when it was detected, RAM only, see the retry block
   manualUp: -1,        // uptime of a manual report seen before the clock was
-                       // valid, -1 = none, dated on the first valid tick
+  // valid, -1 = none, dated on the first valid tick
   wakePending: false,  // wake call received before the clock was valid
   ownSrc: null,        // how the cover names our commands, learned from the
-                       // first report after one, persisted. See the handler.
+  // first report after one, persisted. See the handler.
   active: false,       // tracking is currently running, persisted
   lastAng: 999,
   lastSlat: -1,        // slat_pos last commanded by the tracking, -1 = none
@@ -322,7 +322,7 @@ let ST = {
   lastMove: 0,
   selfCmd: 0,          // timestamp of our own last movement command
   cmdSeq: 0,           // counts our commands, a late refusal of an older
-                       // one must not become a retry
+  // one must not become a retry
   demand: null,        // true = too warm, false = fine, null = never reported
   demandTs: 0,         // 0 = restored but not yet stamped, see tick()
   phase: null,         // true = day, false = night, null = not yet known
@@ -662,7 +662,7 @@ function isOwnSource(src) {
 // at once, and it is never mistaken for our own source below. The list need
 // not be complete: any source not on it is placed by the learning in the
 // status handler.
-let HUMAN_SRC = ["button", "switch", "SHC", "WS_in", "http", "HTTP", "cloud", "CLD", "MQTT", "mqtt", "UI"];
+let HUMAN_SRC = ["button", "switch", "SHC", "WS_in", "HTTP_in", "http", "HTTP", "cloud", "CLD", "MQTT", "mqtt", "UI"];
 
 let LEARN_SEC = 3;     // a report this soon after our command is its start
 
@@ -907,8 +907,14 @@ function onCoverStatus(e) {
     }
     return;
   }
+  // The device's own stops: init after a boot, limit_switch at an end
+  // position, timeout when the motor ran its computed time, which is how
+  // every slat tilt and every stop between the ends is reported. Seen on a
+  // Plus 2PM with firmware 1.7.1: our commands arrive as "loopback", their
+  // ends as limit_switch or timeout, an HTTP command as "HTTP_in".
   if (src === "init") return;
   if (src === "limit_switch") return;
+  if (src === "timeout") return;
   if (t < T_VALID) {
     // No clock yet, so the flag cannot be dated. Remembered by uptime and
     // dated on the first valid tick. No command of ours can be behind it,

@@ -96,7 +96,7 @@ All settings are located in the `CFG` block at the top of the script.
 | `fallbackMonths` | Months that shade without a valid demand | — | 1…12 | `[4..9]` |
 | `windowMaxAgeH` | Age at which the window report counts as lost and the cap is dropped | h | > 0 | `72` |
 | `tickSec` | Cycle time | s | > 0 | `300` |
-| `selfCmdSec` | Window in which a cover report still counts as our own command | s | ≥ 0 | `90` |
+| `selfCmdSec` | Longest travel of the blind, from the command to the stop. Only matters until the script has learned its own source | s | ≥ 0 | `120` |
 | `debug` | Output to the script console | — | true / false | `true` |
 
 ## HTTP endpoints
@@ -271,7 +271,7 @@ consequences:
 - The day release wins over a manual override and clears it, whether it came from `/wake`, from sunrise or from `dayFallbackHour`. Otherwise one tilt in the hour before the release would cost the whole day of shading, and only in `"cmd"` mode, which is nobody's idea of a pause.
 - A wake call while shading is already due skips the day position, instead of travelling up and back down seconds later.
 - A manual operation cancels whatever the automation still had in the pipeline: a day position not yet driven, and a refused command waiting to be repeated. The one exception stays the night position at sunset.
-- A manual operation counts the moment it happens, even while the blind is still moving on the script's command: five seconds after the automation sets off, one press on the button, in the app, in the web interface or from any other controller pauses the day. The script learns how the device names its own commands from the report that follows within seconds of one, and stores the name. From then on every report of its own movement is placed, and every other source is somebody else, whatever the time says. Only before that first lesson, and only inside `selfCmdSec`, is a report it cannot place taken for its own; the log names such reports. A wrong lesson heals itself, the learned name showing up while nothing of the script's is moving cannot be its own.
+- A manual operation counts the moment it happens, even while the blind is still moving on the script's command: five seconds after the automation sets off, one press on the button, in the app, in the web interface or from any other controller pauses the day. The script learns how the device names its own commands from the report that follows within seconds of one, and stores the name. From then on every report of its own movement is placed, and every other source is somebody else, whatever the time says. Only before that first lesson, and only inside `selfCmdSec`, is a report it cannot place taken for its own; the log names such reports. A wrong lesson heals itself, the learned name showing up while nothing of the script's is moving cannot be its own. Seen on a Plus 2PM with firmware 1.7.1: the script's own commands arrive as `loopback`, the end of a travel as `limit_switch` at an end position and as `timeout` after a slat tilt or a stop in between, an HTTP command as `HTTP_in`. The three device stops are never taken for a person.
 
 <br>
 </details>

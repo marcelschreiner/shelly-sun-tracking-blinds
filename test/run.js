@@ -194,6 +194,9 @@ manual('limit_switch');
 manual('script:1');
 manual('timeout');
 check('the end of our own travel is not manual', X.ST.manualDay === -1);
+T = NOON + 600;
+manual('timeout');
+check('a timeout is never manual, even outside the window', X.ST.manualDay === -1);
 
 // ============================================================
 group('learning the own source');
@@ -237,6 +240,21 @@ manual('button');
 manual('limit_switch');
 manual('init');
 check('button, limit_switch and init are never learned', X.ST.ownSrc === null);
+
+// Seen on a Plus 2PM, firmware 1.7.1: our commands are reported as
+// "loopback", the end of a slat tilt or a stop between the ends as
+// "timeout", an HTTP command as "HTTP_in". The timeout is never a person,
+// even once the own source is known and the window no longer protects it.
+kvs = null; X = boot();
+at(NOON);
+T = NOON + 1;
+manual('loopback');              // learned
+T = NOON + 5;
+manual('timeout');               // our tilt has ended
+check('timeout after our own command is not manual, own source known', X.ST.manualDay === -1);
+T = NOON + 7;
+manual('HTTP_in');
+check('HTTP_in is a person', X.ST.manualDay === X.localDay(T));
 
 // The own script id counts as learned too, so the window is gone after the
 // first movement even when the device names scripts as expected.
@@ -749,7 +767,7 @@ coverStatus = null;
 X = boot(); logs = []; firstRun();
 check('a missing cover is reported', logs.some(s => s.indexOf('Cover profile') >= 0));
 coverStatus = { pos_control: true, slat_pos: 0, current_pos: 100 };
-coverConfig = { maxtime_open: 120, maxtime_close: 100 };
+coverConfig = { maxtime_open: 150, maxtime_close: 100 };   // longer than selfCmdSec
 X = boot(); logs = []; firstRun();
 check('a selfCmdSec below the travel time is reported', logs.some(s => s.indexOf('selfCmdSec') >= 0));
 coverConfig = { maxtime_open: 60, maxtime_close: 60 };
