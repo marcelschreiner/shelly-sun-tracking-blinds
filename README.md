@@ -121,7 +121,11 @@ Examples are Apple Home; the principle holds anywhere. Join the Shelly to your S
 <summary><b>Room temperature automation</b></summary>
 <br>
 
-Two automations per room: above the upper threshold call `demand?v=1`, below the lower one `demand?v=0`. The hysteresis therefore lives in the app and can differ per room. In Apple Home use *Convert to Shortcut* and *Get Contents of URL*, which runs on the home hub without a phone.
+Three automations per room. Two on the thresholds: above the upper one call `demand?v=1`, below the lower one `demand?v=0`. The hysteresis therefore lives in the app and can differ per room. And one on the clock, once a day, that sends the current state again: `v=1` while the room is above the upper threshold, `v=0` otherwise.
+
+The third one matters because a report is only trusted for `demandMaxAgeH`, 24 hours by default, and the threshold automations fire only when the temperature crosses a threshold. A week of stable weather would never trigger them, the report would lapse, and the season would decide instead. The daily resend keeps the report fresh. Repeating an unchanged value costs nothing on the device: no flash write, no cycle, only the answer.
+
+In Apple Home use *Convert to Shortcut* and *Get Contents of URL*, which runs on the home hub without a phone. The daily one is a time-based automation whose shortcut reads the thermostat and picks the URL with an *If*.
 
 <br>
 </details>
@@ -130,7 +134,9 @@ Two automations per room: above the upper threshold call `demand?v=1`, below the
 <summary><b>Window contact automation</b></summary>
 <br>
 
-One automation per window: call `/script/1/window?v=1` when it opens and `?v=0` when it closes. Any contact the platform can read will do.
+Three automations per window as well. Two on the contact: `/script/1/window?v=1` when it opens, `?v=0` when it closes. And one on the clock, once a day, that sends the current state again.
+
+A contact only speaks when it changes, so the daily resend does two things. It keeps a long airing from lapsing after `windowMaxAgeH`, and it corrects a missed event, a closing the hub never delivered for instance, within a day instead of never. Any contact the platform can read will do.
 
 <br>
 </details>
